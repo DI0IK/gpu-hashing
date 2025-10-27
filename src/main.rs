@@ -93,7 +93,7 @@ impl HashClient {
         } // Mutex lock is released here
           // --- End Rate Limiting ---
 
-        println!("\n[Net] Connecting to server: {}", url);
+        // println!("\n[Net] Connecting to server: {}", url);
         let mut res = self
             .http_client
             .get(url)
@@ -325,10 +325,31 @@ fn main() {
     println!("Using name: {}", name);
 
     if !name.ends_with("-B6") {
+        if name.len() > 13 {
+            name.truncate(13);
+        }
         name.push_str("-B6");
     }
 
     let client = HashClient::new(name);
+    // --- ADDED: Debug mode from environment ---
+    // If DEBUG_MODE is set to "1" (or any non-empty value), we enable debug.
+    // If DEBUG_DIFFICULTY is set, use it as a fixed difficulty for mining.
+    let debug_mode = std::env::var("DEBUG_MODE").unwrap_or_default();
+    let debug_enabled = !debug_mode.is_empty();
+    let debug_difficulty: Option<usize> = std::env::var("DEBUG_DIFFICULTY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    if debug_enabled {
+        if let Some(d) = debug_difficulty {
+            println!("[Debug] Debug mode enabled. Forcing difficulty = {}", d);
+        } else {
+            println!(
+                "[Debug] Debug mode enabled. No DEBUG_DIFFICULTY set; will use server difficulty."
+            );
+        }
+        println!("[Debug] Found seeds will NOT be submitted to server.");
+    }
     let mut current_parent: String;
     let mut current_difficulty: usize;
 
@@ -376,31 +397,37 @@ fn main() {
         let checker_handle =
             spawn_checker_thread(client.clone(), current_parent.clone(), stop_signal.clone());
 
+        // Determine effective difficulty for this round (may be overridden in debug)
+        let effective_difficulty = if debug_enabled {
+            debug_difficulty.unwrap_or(current_difficulty)
+        } else {
+            current_difficulty
+        };
+
         // 3. Start the miner
         let mining_result = if let Some(miner) = &mut gpu_miner_instance {
             // --- GPU Path ---
             println!(
                 "[GPU] Finding seed for parent {} with difficulty {}...",
-                current_parent, current_difficulty
+                current_parent, effective_difficulty
             );
             let base_line = client.get_line(&current_parent, "");
 
             // --- MODIFIED: Call new GPU function & handle OclResult ---
-            match miner.find_seed_gpu(&base_line, current_difficulty, stop_signal.clone()) {
-                Ok(Some(result)) => Some(result), // Found
-                Ok(None) => None,                 // Interrupted
+            match miner.find_seed_gpu(&base_line, effective_difficulty, stop_signal.clone()) {
+                Ok(found) => found, // found: Option<(String, String)>
                 Err(e) => {
                     eprintln!(
                         "[GPU] GPU miner failed: {}. Falling back to CPU for this round.",
                         e
                     );
                     // Fallback to CPU
-                    client.find_seed_cpu(&current_parent, current_difficulty, stop_signal.clone())
+                    client.find_seed_cpu(&current_parent, effective_difficulty, stop_signal.clone())
                 }
             }
         } else {
             // --- CPU Path (Original) ---
-            client.find_seed_cpu(&current_parent, current_difficulty, stop_signal.clone())
+            client.find_seed_cpu(&current_parent, effective_difficulty, stop_signal.clone())
         };
 
         // 4. Stop the checker thread
@@ -411,39 +438,52 @@ fn main() {
         // 5. Process the result
         if let Some((seed, our_hash_hex)) = mining_result {
             // --- We found a hash! ---
-            // 5a. Submit the seed to the server
-            match client.send_seed(&current_parent, &seed) {
-                Ok(new_state) => {
-                    // 5b. Verify if we won the round
-                    if new_state.parent_hash == our_hash_hex {
-                        println!(
-                            "[Net] Server accepted our hash! New parent is: {}",
-                            new_state.parent_hash
-                        );
-                    } else {
-                        println!(
-                            "[Net] !!! Server did NOT accept our hash (someone was faster). !!!"
-                        );
-                        println!("    Our hash:   {}", our_hash_hex);
-                        println!("    New parent: {}", new_state.parent_hash);
-                    }
-                    // Update state for the next round
-                    current_parent = new_state.parent_hash;
-                    current_difficulty = new_state.difficulty;
+            if debug_enabled {
+                // In debug mode we don't submit to server.
+                println!("[Debug] Found seed (not submitting):");
+                println!("    Parent: {}", current_parent);
+                println!("    Seed: {}", seed);
+                println!("    Hash: {}", our_hash_hex);
+                // Simulate acceptance locally by updating parent.
+                current_parent = our_hash_hex;
+                if let Some(d) = debug_difficulty {
+                    current_difficulty = d;
                 }
-                Err(e) => {
-                    eprintln!("[Net] Error submitting seed: {}. Retrying...", e);
-                    // On error, just try to get the latest parent and continue
-                    match client.get_latest_parent() {
-                        Ok(state) => {
-                            println!("[Net] Difficulty: {}", state.difficulty);
-                            println!("[Net] New parent hash: {}", state.parent_hash);
-                            current_parent = state.parent_hash;
-                            current_difficulty = state.difficulty;
+            } else {
+                // 5a. Submit the seed to the server
+                match client.send_seed(&current_parent, &seed) {
+                    Ok(new_state) => {
+                        // 5b. Verify if we won the round
+                        if new_state.parent_hash == our_hash_hex {
+                            println!(
+                                "[Net] Server accepted our hash! New parent is: {}",
+                                new_state.parent_hash
+                            );
+                        } else {
+                            println!(
+                                "[Net] !!! Server did NOT accept our hash (someone was faster). !!!"
+                            );
+                            println!("    Our hash:   {}", our_hash_hex);
+                            println!("    New parent: {}", new_state.parent_hash);
                         }
-                        Err(e) => {
-                            eprintln!("Fatal Error: Could not re-sync with server: {}", e);
-                            thread::sleep(Duration::from_secs(10)); // Wait before retrying
+                        // Update state for the next round
+                        current_parent = new_state.parent_hash;
+                        current_difficulty = new_state.difficulty;
+                    }
+                    Err(e) => {
+                        eprintln!("[Net] Error submitting seed: {}. Retrying...", e);
+                        // On error, just try to get the latest parent and continue
+                        match client.get_latest_parent() {
+                            Ok(state) => {
+                                println!("[Net] Difficulty: {}", state.difficulty);
+                                println!("[Net] New parent hash: {}", state.parent_hash);
+                                current_parent = state.parent_hash;
+                                current_difficulty = state.difficulty;
+                            }
+                            Err(e) => {
+                                eprintln!("Fatal Error: Could not re-sync with server: {}", e);
+                                thread::sleep(Duration::from_secs(10)); // Wait before retrying
+                            }
                         }
                     }
                 }
