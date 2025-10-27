@@ -372,7 +372,7 @@ impl GpuMiner {
         difficulty: usize,
     ) -> OclResult<(String, String)> {
         let start_time = Instant::now();
-        let mut start_nonce: u64 = 0;
+        let mut start_nonce: u64 = rand::random();
         let base_len = base_line.len();
 
         // --- Create GPU Buffers ---
