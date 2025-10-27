@@ -392,6 +392,9 @@ fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).unwrap();
 
+        // clear current terminal
+        terminal.clear().unwrap();
+
         // Render loop
         while !APP_EXIT.load(Ordering::Relaxed) {
             // draw
