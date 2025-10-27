@@ -11,10 +11,7 @@ hostname = "0.3"
 rand = "0.8"
 rayon = "1.10"
 lazy_static = "1.4"
-# --- REMOVED: atomic_option was the wrong crate ---
-# atomic_option = "0.1.2"
-
-# --- ADDED FOR GPU SUPPORT ---
-# This is the Rust wrapper for OpenCL
 ocl = "0.19"
+tui = "0.19"
+crossterm = "0.26"
 

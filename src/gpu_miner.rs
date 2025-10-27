@@ -289,7 +289,7 @@ impl GpuMiner {
             })
             .ok_or("No GPU device found")?;
 
-        println!("[GPU] Using OpenCL device: {}", device.name()?);
+        crate::events::publish_event(&format!("[GPU] Using OpenCL device: {}", device.name()?));
 
         let context = Context::builder().devices(device).build()?;
         let queue = Queue::new(&context, device, None)?;
@@ -354,13 +354,15 @@ impl GpuMiner {
             .len(32)
             .build()?;
 
-        println!("[GPU] Starting hash search with batch size {GLOBAL_WORK_SIZE}...");
+        crate::events::publish_event(&format!(
+            "[GPU] Starting hash search with batch size {GLOBAL_WORK_SIZE}..."
+        ));
 
         // --- Main Mining Loop ---
         loop {
             // --- ADDED: Check stop signal before starting batch ---
             if stop_signal.load(Ordering::Relaxed) {
-                println!("[GPU] Stop signal received. Aborting work.");
+                crate::events::publish_event("[GPU] Stop signal received. Aborting work.");
                 return Ok(None); // Interrupted
             }
 
@@ -420,16 +422,16 @@ impl GpuMiner {
                     let hashes_done = TOTAL_HASHES.load(Ordering::Relaxed); // Read total
                     let hash_rate = (hashes_done as f64) / duration.as_secs_f64();
 
-                    println!("\n+++ [GPU] Found valid seed! +++");
-                    println!("    Nonce: {}", found_nonce);
-                    println!("    Seed:  {}", seed_str);
-                    println!("    Hash:  {} (Bits: ?)", hash_hex);
-                    println!(
-                        "    Perf:  {} hashes in {:?} ({:.2} MH/s)",
+                    crate::events::publish_event(&format!(
+                        "+++ [GPU] Found valid seed! Nonce: {} Seed: {} Hash: {}",
+                        found_nonce, seed_str, hash_hex
+                    ));
+                    crate::events::publish_event(&format!(
+                        "GPU perf: {} hashes in {:?} ({:.2} MH/s)",
                         hashes_done,
                         duration,
                         hash_rate / 1_000_000.0
-                    );
+                    ));
 
                     // Return the (seed, hash_hex) tuple
                     return Ok(Some((seed_str, hash_hex)));
@@ -438,7 +440,9 @@ impl GpuMiner {
                     // Our kernel found a hash, but *at the same time*
                     // the checker thread set the stop_signal.
                     // We must discard our result as it's now stale.
-                    println!("[GPU] Found hash, but was interrupted. Discarding.");
+                    crate::events::publish_event(
+                        "[GPU] Found hash, but was interrupted. Discarding.",
+                    );
                     return Ok(None); // Interrupted
                 }
             }

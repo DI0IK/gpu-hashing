@@ -2,18 +2,37 @@ use rand::{thread_rng, Rng};
 use rayon::iter::ParallelIterator;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
+use std::fs;
+use std::io::stdout;
 use std::io::Read;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+// TUI deps
+use crossterm::event::{Event as CEvent, KeyCode, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use tui::backend::CrosstermBackend;
+use tui::layout::{Constraint, Direction, Layout};
+use tui::text::{Span, Spans};
+use tui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use tui::Terminal;
+
+mod events;
 mod gpu_miner;
 
 // Use lazy_static to create a global, mutable timestamp for rate limiting.
 lazy_static::lazy_static! {
     static ref LAST_REQUEST: Mutex<Instant> = Mutex::new(Instant::now() - Duration::from_secs(5));
     pub static ref TOTAL_HASHES: AtomicU64 = AtomicU64::new(0);
+    // Global app exit flag (set by TUI 'q' or Ctrl-C)
+    pub static ref APP_EXIT: AtomicBool = AtomicBool::new(false);
 }
 
 const SERVER_URL: &str = "http://hash.h10a.de/?raw";
@@ -34,6 +53,62 @@ struct HashClient {
 struct ServerState {
     difficulty: usize,
     parent_hash: String,
+}
+
+// UI state shared with the TUI thread
+const BLOCKS_FILE: &str = "blocks_mined.txt";
+
+struct UIState {
+    recent_events: VecDeque<String>,
+    hash_rate: f64,
+    username: String,
+    parent: String,
+    total_blocks_mined: u64,
+}
+
+fn load_blocks_mined_from_disk() -> u64 {
+    let p = Path::new(BLOCKS_FILE);
+    if !p.exists() {
+        return 0;
+    }
+    match fs::read_to_string(p) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+fn save_blocks_mined_to_disk(n: u64) {
+    // Write atomically if possible: write to temp then rename
+    let tmp = format!("{}.tmp", BLOCKS_FILE);
+    if fs::write(&tmp, n.to_string()).is_ok() {
+        let _ = fs::rename(tmp, BLOCKS_FILE);
+    }
+}
+
+impl UIState {
+    fn new(username: String, parent: String) -> Self {
+        let total_blocks_mined = load_blocks_mined_from_disk();
+        UIState {
+            recent_events: VecDeque::with_capacity(16),
+            hash_rate: 0.0,
+            username,
+            parent,
+            total_blocks_mined,
+        }
+    }
+
+    fn push_event(&mut self, e: String) {
+        const MAX_EVENTS: usize = 16;
+        self.recent_events.push_front(e);
+        while self.recent_events.len() > MAX_EVENTS {
+            self.recent_events.pop_back();
+        }
+    }
+
+    fn increment_blocks(&mut self) {
+        self.total_blocks_mined = self.total_blocks_mined.saturating_add(1);
+        save_blocks_mined_to_disk(self.total_blocks_mined);
+    }
 }
 
 /// Counts the number of leading zero bits in a byte array (hash).
@@ -86,7 +161,10 @@ impl HashClient {
             let elapsed = last_req.elapsed();
             if elapsed < MIN_REQUEST_GAP {
                 let sleep_time = MIN_REQUEST_GAP - elapsed;
-                println!("[Net] Rate limiting: sleeping for {:?}", sleep_time);
+                events::publish_event(&format!(
+                    "[Net] Rate limiting: sleeping for {:?}",
+                    sleep_time
+                ));
                 thread::sleep(sleep_time);
             }
             *last_req = Instant::now();
@@ -153,13 +231,13 @@ impl HashClient {
 
     /// Submits a found seed to the server.
     fn send_seed(&self, parent: &str, seed: &str) -> Result<ServerState, String> {
-        println!("[Net] Submitting seed to server...");
+        events::publish_event("[Net] Submitting seed to server...");
         let url = format!("{}&Z={}&P={}&R={}", SERVER_URL, parent, self.name, seed);
         // --- MODIFIED: Call get_server_state and print results here ---
         let result = self.get_server_state(&url);
         if let Ok(state) = &result {
-            println!("[Net] Difficulty: {}", state.difficulty);
-            println!("[Net] New parent hash: {}", state.parent_hash);
+            events::publish_event(&format!("[Net] Difficulty: {}", state.difficulty));
+            events::publish_event(&format!("[Net] New parent hash: {}", state.parent_hash));
         }
         result
     }
@@ -173,12 +251,12 @@ impl HashClient {
         difficulty: usize,
         stop_signal: Arc<AtomicBool>,
     ) -> Option<(String, String)> {
-        println!(
+        events::publish_event(&format!(
             "[CPU] Finding seed for parent {} with difficulty {} (using {} threads)...",
             parent,
             difficulty,
             rayon::current_num_threads()
-        );
+        ));
 
         let result = Arc::new(Mutex::new(None::<(String, String)>));
 
@@ -210,12 +288,13 @@ impl HashClient {
                     .is_ok()
                 {
                     let hash_hex = hex::encode(&hash_bytes);
-                    println!(
-                        "\n+++ [CPU] Found valid seed! (Thread {}) +++",
-                        rayon::current_thread_index().unwrap_or(0)
-                    );
-                    println!("    Seed: {}", seed);
-                    println!("    Hash: {} (Bits: {})", hash_hex, bits);
+                    events::publish_event(&format!(
+                        "+++ [CPU] Found valid seed! (Thread {}) Seed: {} Hash: {} (Bits: {})",
+                        rayon::current_thread_index().unwrap_or(0),
+                        seed,
+                        hash_hex,
+                        bits
+                    ));
 
                     let mut res_guard = result_clone.lock().unwrap();
                     *res_guard = Some((seed, hash_hex));
@@ -249,6 +328,7 @@ fn spawn_checker_thread(
     client: HashClient,
     current_parent: String,
     stop_signal: Arc<AtomicBool>,
+    ui_state: Arc<Mutex<UIState>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         loop {
@@ -272,27 +352,127 @@ fn spawn_checker_thread(
                 Ok(state) => {
                     // 4. Compare parent hash
                     if state.parent_hash != current_parent {
-                        println!(
-                            "\n[Net] Stale parent detected! Server parent is {}, we are on {}.",
-                            state.parent_hash, current_parent
-                        );
+                        // Push a stale-parent event into UI state
+                        if let Ok(mut ui) = ui_state.lock() {
+                            ui.push_event(format!(
+                                "Stale parent: server {} != local {}",
+                                state.parent_hash, current_parent
+                            ));
+                            // Show new parent in UI (server value)
+                            ui.parent = state.parent_hash.clone();
+                        }
+
                         // 5. Signal the miner to stop
                         if stop_signal
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                             .is_ok()
                         {
-                            println!("[Net] Stop signal sent to miner.");
+                            // no console print; UI shows event
                         }
                         break; // Stop this checker thread
                     } else {
-                        // println!("[Net] Parent check OK."); // Uncomment for debugging
+                        // parent unchanged
                     }
                 }
-                Err(e) => {
-                    println!("[Net] Checker thread error: {}. Ignoring.", e);
+                Err(_e) => {
+                    // Ignore checker errors; UI isn't updated for these
                 }
             }
         }
+    })
+}
+
+/// Spawn a simple TUI that renders username, parent, hash rate and recent events.
+fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        // Terminal setup
+        let mut stdout = stdout();
+        enable_raw_mode().ok();
+        execute!(stdout, EnterAlternateScreen).ok();
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Render loop
+        while !APP_EXIT.load(Ordering::Relaxed) {
+            // draw
+            let ui_clone = ui_state.clone();
+            let draw_result = terminal.draw(|f| {
+                let size = f.size();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(3),
+                    ])
+                    .split(size);
+
+                // Header: username and parent and rate
+                let (username, parent, rate, events, blocks) = if let Ok(ui) = ui_clone.lock() {
+                    (
+                        ui.username.clone(),
+                        ui.parent.clone(),
+                        ui.hash_rate,
+                        ui.recent_events.clone(),
+                        ui.total_blocks_mined,
+                    )
+                } else {
+                    ("-".to_string(), "-".to_string(), 0.0, VecDeque::new(), 0u64)
+                };
+
+                let header = Paragraph::new(Spans::from(vec![
+                    Span::raw(format!("User: {}    ", username)),
+                    Span::raw(format!("Parent: {}    ", parent)),
+                    Span::raw(format!("Rate: {}    ", format_hash_rate(rate))),
+                    Span::raw(format!("Blocks: {}", blocks)),
+                ]))
+                .block(Block::default().borders(Borders::ALL).title("Status"));
+                f.render_widget(header, chunks[0]);
+
+                let info = Paragraph::new("Recent events (stale parent / block success)")
+                    .block(Block::default().borders(Borders::ALL).title("Events"));
+                f.render_widget(info, chunks[1]);
+
+                // Events list
+                let items: Vec<ListItem> = events
+                    .iter()
+                    .map(|s| ListItem::new(Spans::from(vec![Span::raw(s.clone())])))
+                    .collect();
+                let list =
+                    List::new(items).block(Block::default().borders(Borders::ALL).title("Recent"));
+                f.render_widget(list, chunks[2]);
+            });
+
+            if draw_result.is_err() {
+                // ignore render errors briefly
+            }
+
+            // Poll for key events (200ms)
+            if crossterm::event::poll(Duration::from_millis(200)).unwrap_or(false) {
+                if let Ok(ev) = crossterm::event::read() {
+                    if let CEvent::Key(key) = ev {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                APP_EXIT.store(true, Ordering::SeqCst);
+                                // exit entire process immediately to avoid blocked threads
+                                std::process::exit(0);
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                APP_EXIT.store(true, Ordering::SeqCst);
+                                std::process::exit(0);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Restore terminal
+        disable_raw_mode().ok();
+        let mut stdout = std::io::stdout();
+        execute!(stdout, LeaveAlternateScreen).ok();
     })
 }
 
@@ -301,14 +481,7 @@ fn main() {
     const USE_GPU: bool = true;
     // -------------------------
 
-    // --- ADDED: Spawn hash rate logging thread ---
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(5));
-        let hashes = TOTAL_HASHES.swap(0, Ordering::SeqCst);
-        let rate = (hashes as f64) / 5.0;
-        println!("[Stats] Local hash rate: {}", format_hash_rate(rate));
-    });
-    // ---------------------------------------------
+    // (stats thread moved later after UI state is created)
 
     // 1. Get client name
     let mut name = hostname::get().map_or("RustClient".to_string(), |s| {
@@ -321,8 +494,8 @@ fn main() {
         }
     }
 
-    println!("Starting Rust HashClient...");
-    println!("Using name: {}", name);
+    events::publish_event("Starting Rust HashClient...");
+    events::publish_event(&format!("Using name: {}", name));
 
     if !name.ends_with("-B6") {
         if name.len() > 13 {
@@ -342,13 +515,16 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok());
     if debug_enabled {
         if let Some(d) = debug_difficulty {
-            println!("[Debug] Debug mode enabled. Forcing difficulty = {}", d);
+            events::publish_event(&format!(
+                "[Debug] Debug mode enabled. Forcing difficulty = {}",
+                d
+            ));
         } else {
-            println!(
-                "[Debug] Debug mode enabled. No DEBUG_DIFFICULTY set; will use server difficulty."
+            events::publish_event(
+                "[Debug] Debug mode enabled. No DEBUG_DIFFICULTY set; will use server difficulty.",
             );
         }
-        println!("[Debug] Found seeds will NOT be submitted to server.");
+        events::publish_event("[Debug] Found seeds will NOT be submitted to server.");
     }
     let mut current_parent: String;
     let mut current_difficulty: usize;
@@ -358,12 +534,15 @@ fn main() {
         println!("[GPU] Initializing OpenCL GPU miner...");
         match gpu_miner::GpuMiner::new() {
             Ok(miner) => {
-                println!("[GPU] GPU Miner initialized successfully!");
+                events::publish_event("[GPU] GPU Miner initialized successfully!");
                 Some(miner)
             }
             Err(e) => {
-                eprintln!("[GPU] FATAL: Failed to initialize GPU miner: {}", e);
-                eprintln!("[GPU] Check your OpenCL drivers. Falling back to CPU.");
+                events::publish_event(&format!(
+                    "[GPU] FATAL: Failed to initialize GPU miner: {}",
+                    e
+                ));
+                events::publish_event("[GPU] Check your OpenCL drivers. Falling back to CPU.");
                 None
             }
         }
@@ -375,8 +554,8 @@ fn main() {
     // Get initial parent
     match client.get_latest_parent() {
         Ok(state) => {
-            println!("[Net] Difficulty: {}", state.difficulty);
-            println!("[Net] New parent hash: {}", state.parent_hash);
+            events::publish_event(&format!("[Net] Difficulty: {}", state.difficulty));
+            events::publish_event(&format!("[Net] New parent hash: {}", state.parent_hash));
             current_parent = state.parent_hash;
             current_difficulty = state.difficulty;
         }
@@ -386,16 +565,63 @@ fn main() {
         }
     }
 
+    // Create UI state and spawn the TUI and stats threads
+    let ui_state = Arc::new(Mutex::new(UIState::new(
+        client.name.as_ref().to_string(),
+        current_parent.clone(),
+    )));
+
+    // Create an event channel and initialize the global event sender
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<String>();
+    events::init_event_sender(ev_tx.clone());
+
+    // Forward events from channel into the UI state
+    {
+        let ui_clone = ui_state.clone();
+        thread::spawn(move || {
+            for msg in ev_rx {
+                if let Ok(mut ui) = ui_clone.lock() {
+                    ui.push_event(msg);
+                }
+            }
+        });
+    }
+
+    // Spawn TUI
+    let _tui_handle = spawn_tui(ui_state.clone());
+
+    // Spawn hash rate logging thread -> update UI state instead of printing
+    {
+        let ui_clone = ui_state.clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(5));
+            let hashes = TOTAL_HASHES.swap(0, Ordering::SeqCst);
+            let rate = (hashes as f64) / 5.0;
+            if let Ok(mut ui) = ui_clone.lock() {
+                ui.hash_rate = rate;
+            }
+        });
+    }
+
     // Main game loop
     loop {
+        // Exit if TUI requested quit
+        if APP_EXIT.load(Ordering::Relaxed) {
+            println!("Exiting (requested by UI)");
+            break;
+        }
         // --- MODIFIED: Main loop logic completely rewritten ---
 
         // 1. Create a new stop signal for this round
         let stop_signal = Arc::new(AtomicBool::new(false));
 
         // 2. Spawn the checker thread
-        let checker_handle =
-            spawn_checker_thread(client.clone(), current_parent.clone(), stop_signal.clone());
+        let checker_handle = spawn_checker_thread(
+            client.clone(),
+            current_parent.clone(),
+            stop_signal.clone(),
+            ui_state.clone(),
+        );
 
         // Determine effective difficulty for this round (may be overridden in debug)
         let effective_difficulty = if debug_enabled {
@@ -417,10 +643,10 @@ fn main() {
             match miner.find_seed_gpu(&base_line, effective_difficulty, stop_signal.clone()) {
                 Ok(found) => found, // found: Option<(String, String)>
                 Err(e) => {
-                    eprintln!(
+                    events::publish_event(&format!(
                         "[GPU] GPU miner failed: {}. Falling back to CPU for this round.",
                         e
-                    );
+                    ));
                     // Fallback to CPU
                     client.find_seed_cpu(&current_parent, effective_difficulty, stop_signal.clone())
                 }
@@ -445,7 +671,11 @@ fn main() {
                 println!("    Seed: {}", seed);
                 println!("    Hash: {}", our_hash_hex);
                 // Simulate acceptance locally by updating parent.
-                current_parent = our_hash_hex;
+                current_parent = our_hash_hex.clone();
+                if let Ok(mut ui) = ui_state.lock() {
+                    ui.push_event(format!("(debug) Block accepted: {}", current_parent));
+                    ui.parent = current_parent.clone();
+                }
                 if let Some(d) = debug_difficulty {
                     current_difficulty = d;
                 }
@@ -467,17 +697,32 @@ fn main() {
                             println!("    New parent: {}", new_state.parent_hash);
                         }
                         // Update state for the next round
-                        current_parent = new_state.parent_hash;
+                        if new_state.parent_hash == our_hash_hex {
+                            if let Ok(mut ui) = ui_state.lock() {
+                                ui.push_event(format!("Block accepted: {}", new_state.parent_hash));
+                                ui.increment_blocks();
+                            }
+                        }
+                        current_parent = new_state.parent_hash.clone();
+                        if let Ok(mut ui) = ui_state.lock() {
+                            ui.parent = new_state.parent_hash.clone();
+                        }
                         current_difficulty = new_state.difficulty;
                     }
                     Err(e) => {
-                        eprintln!("[Net] Error submitting seed: {}. Retrying...", e);
+                        events::publish_event(&format!(
+                            "[Net] Error submitting seed: {}. Retrying...",
+                            e
+                        ));
                         // On error, just try to get the latest parent and continue
                         match client.get_latest_parent() {
                             Ok(state) => {
                                 println!("[Net] Difficulty: {}", state.difficulty);
                                 println!("[Net] New parent hash: {}", state.parent_hash);
-                                current_parent = state.parent_hash;
+                                current_parent = state.parent_hash.clone();
+                                if let Ok(mut ui) = ui_state.lock() {
+                                    ui.parent = current_parent.clone();
+                                }
                                 current_difficulty = state.difficulty;
                             }
                             Err(e) => {
@@ -493,13 +738,16 @@ fn main() {
             println!("[Main] Miner interrupted (stale parent). Fetching new parent...");
             match client.get_latest_parent() {
                 Ok(state) => {
-                    println!("[Net] Difficulty: {}", state.difficulty);
-                    println!("[Net] New parent hash: {}", state.parent_hash);
+                    events::publish_event(&format!("[Net] Difficulty: {}", state.difficulty));
+                    events::publish_event(&format!("[Net] New parent hash: {}", state.parent_hash));
                     current_parent = state.parent_hash;
                     current_difficulty = state.difficulty;
                 }
                 Err(e) => {
-                    eprintln!("Fatal Error: Could not re-sync with server: {}", e);
+                    events::publish_event(&format!(
+                        "Fatal Error: Could not re-sync with server: {}",
+                        e
+                    ));
                     thread::sleep(Duration::from_secs(10)); // Wait before retrying
                 }
             }
