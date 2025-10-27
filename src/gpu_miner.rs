@@ -1,47 +1,32 @@
 //! GPU Miner (OpenCL) Module
 //!
-//! This file contains all the logic for finding a hash seed using the GPU.
+//! --- MODIFIED ---
+//! This version is now "interruptible".
 //!
-//! --- How It Works ---
+//! `find_seed_gpu` now accepts an `Arc<AtomicBool> stop_signal`.
 //!
-//! 1.  `GpuMiner::new()`: Called once at startup. It finds the first available
-//!     OpenCL GPU, creates a "Context", and compiles the OpenCL C "Kernel"
-//!     (the `OPENCL_KERNEL_SRC` string).
+//! 1.  It checks this signal *before* launching a new kernel batch.
+//!     If `true`, it immediately stops and returns `Ok(None)`.
 //!
-//! 2.  `find_seed_gpu()`: Called in the main loop.
-//!     a.  It takes the "base line" (e.g., "parent_hash my_name ") and the
-//!         `difficulty`.
-//!     b.  It creates buffers (memory) on the GPU to hold the input
-//!         (`base_line`) and the output (the `found_seed` and `found_hash`).
-//!     c.  It launches the OpenCL kernel in massive batches (e.g., 1 million
-//!         "threads" at a time).
-//!     d.  Each GPU "thread" gets a unique ID (`global_id`) and calculates a
-//!         nonce (seed) to test: `nonce = start_nonce + global_id`.
-//!     e.  The kernel hashes `base_line + nonce_as_hex_string` entirely on the
-//!         GPU.
-//!     f.  If a thread finds a valid hash, it *atomically* writes its `nonce`
-//!         and the `hash` to the output buffers and stops all other threads.
-//!     g.  The Rust code (host) checks the output buffer. If a `nonce` was
-//     found, it's returned.
-//!     h.  If no `nonce` was found in the batch, it increases `start_nonce`
-//     and launches the *next* batch.
+//! 2.  If the kernel *finds* a solution, the host code (Rust)
+//!     must "claim" victory by atomically setting `stop_signal`
+//!     from `false` to `true`.
+//!
+//! 3.  If this atomic `compare_exchange` fails, it means the
+//!     checker thread *just* set the signal *at the same time*.
+//!     The miner then discards its (now stale) result and
+//!     returns `Ok(None)`.
 //!
 
 use crate::TOTAL_HASHES;
 use ocl::{
     builders::ProgramBuilder,
-    enums::{DeviceInfo, DeviceInfoResult}, // --- ADDED ---
-    Buffer,
-    Context,
-    Device,
-    DeviceType,
-    Kernel,
-    MemFlags,
-    Platform,
-    Queue,
-    Result as OclResult,
+    enums::{DeviceInfo, DeviceInfoResult},
+    Buffer, Context, Device, DeviceType, Kernel, MemFlags, Platform, Queue, Result as OclResult,
 };
-use std::sync::atomic::Ordering;
+// --- ADDED: Need AtomicBool and Arc for the stop signal ---
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// The OpenCL C kernel. This is a small program compiled at runtime
@@ -88,10 +73,7 @@ constant uint K[64] = {
 
 
 // Helper to convert a ulong nonce to a 1-16 char hex string
-// This is the tricky part, as sprintf is not available.
-// Returns the length of the hex string.
 inline int ulong_to_hex(ulong n, char* out) {
-    // --- FIXED: Use 'const' for local array, not 'constant' ---
     const char hex_chars[] = "0123456789abcdef";
     char buf[16];
     int i = 0;
@@ -106,7 +88,6 @@ inline int ulong_to_hex(ulong n, char* out) {
         n >>= 4;
     }
 
-    // Reverse the buffer into out
     for (int j = 0; j < i; j++) {
         out[j] = buf[i - 1 - j];
     }
@@ -148,7 +129,6 @@ void sha256_transform(sha256_ctx *ctx) {
 void sha256(const uchar* data, int len, uchar* hash_out) {
     sha256_ctx ctx;
     
-    // Init H
     ctx.H[0] = 0x6a09e667; ctx.H[1] = 0xbb67ae85; ctx.H[2] = 0x3c6ef372; ctx.H[3] = 0xa54ff53a;
     ctx.H[4] = 0x510e527f; ctx.H[5] = 0x9b05688c; ctx.H[6] = 0x1f83d9ab; ctx.H[7] = 0x5be0cd19;
     ctx.N = 0;
@@ -157,7 +137,6 @@ void sha256(const uchar* data, int len, uchar* hash_out) {
     while(pos < len) {
         int copy_len = min(64 - (int)(ctx.N % 64), len - pos);
         
-        // --- FIXED: Replaced memcpy with a loop ---
         for(int i=0; i < copy_len; i++) {
             ctx.M[(ctx.N % 64) + i] = data[pos + i];
         }
@@ -175,7 +154,6 @@ void sha256(const uchar* data, int len, uchar* hash_out) {
     ctx.M[n_mod_64++] = 0x80;
     
     if (n_mod_64 > 56) {
-        // --- FIXED: Replaced memset with a loop ---
         for(int i=n_mod_64; i < 64; i++) {
             ctx.M[i] = 0;
         }
@@ -183,12 +161,10 @@ void sha256(const uchar* data, int len, uchar* hash_out) {
         n_mod_64 = 0;
     }
     
-    // --- FIXED: Replaced memset with a loop ---
     for(int i=n_mod_64; i < 56; i++) {
         ctx.M[i] = 0;
     }
     
-    // Append length
     ulong n_bits = ctx.N * 8;
     ctx.M[56] = (uchar)(n_bits >> 56);
     ctx.M[57] = (uchar)(n_bits >> 48);
@@ -201,7 +177,6 @@ void sha256(const uchar* data, int len, uchar* hash_out) {
 
     sha256_transform(&ctx);
     
-    // Output hash
     for(int i = 0; i < 8; i++) {
         hash_out[i*4 + 0] = (uchar)(ctx.H[i] >> 24);
         hash_out[i*4 + 1] = (uchar)(ctx.H[i] >> 16);
@@ -212,7 +187,6 @@ void sha256(const uchar* data, int len, uchar* hash_out) {
 
 
 // Helper to check for N leading zero bits
-// --- FIXED: Changed address space from 'global const' to 'const' (defaults to private) ---
 inline int count_zero_bits_kernel(const uchar* hash, int difficulty) {
     int bits = 0;
     for (int i = 0; i < 32; i++) {
@@ -220,7 +194,6 @@ inline int count_zero_bits_kernel(const uchar* hash, int difficulty) {
         if (byte == 0) {
             bits += 8;
         } else {
-            // Count leading zeros in the first non-zero byte
             uchar b = byte;
             while ((b & 0x80) == 0) {
                 bits++;
@@ -236,47 +209,38 @@ inline int count_zero_bits_kernel(const uchar* hash, int difficulty) {
 
 /*
  * == The Main Kernel ==
- *
- * This is launched in parallel by millions of "threads" on the GPU.
  */
 __kernel void find_hash_kernel(
-    // --- FIXED: Changed 'char' to 'uchar' to match Rust's u8 buffer ---
-    __global const uchar* base_line, // "parent_hash name "
-    int base_len,                   // Length of base_line
-    ulong start_nonce,              // The starting nonce for this *batch*
-    uint difficulty,                // Target difficulty
-    // --- FIXED: Use ulong for nonce, but uint for atomic result ---
-    __global uint* result_local_id, // Output: The winning local_id (if found)
-    __global uchar* result_hash     // Output: The winning hash (if found)
+    __global const uchar* base_line,
+    int base_len,
+    ulong start_nonce,
+    uint difficulty,
+    __global uint* result_local_id,
+    __global uchar* result_hash
 ) {
-    // Get the unique ID for this thread
     ulong global_id = get_global_id(0);
     ulong nonce = start_nonce + global_id;
 
-    // --- FIXED: Read from uint buffer, not ulong. Use simple dereference ---
+    // --- Optimization: Check if already found before doing any work ---
     if (*result_local_id != (uint)(-1)) {
         return;
     }
 
     // 1. Construct the input string: "parent_hash name nonce_hex"
-    uchar line[256]; // Buffer for the full line
+    uchar line[256];
     
-    // --- FIXED: Replaced memcpy with a loop ---
     for(int i=0; i < base_len; i++) {
         line[i] = base_line[i];
     }
 
-    // Convert the nonce (ulong) to a hex string
-    char nonce_hex[17]; // 16 hex chars + null
+    char nonce_hex[17];
     int nonce_len = ulong_to_hex(nonce, nonce_hex);
 
-    // --- FIXED: Replaced memcpy with a loop ---
     for(int i=0; i < nonce_len; i++) {
         line[base_len + i] = nonce_hex[i];
     }
     
     int total_len = base_len + nonce_len;
-    // line[total_len] = 0; // Not needed for sha256 function
 
     // 2. Hash the constructed line
     uchar hash_output[32];
@@ -287,7 +251,7 @@ __kernel void find_hash_kernel(
 
     if (bits >= difficulty) {
         // We found a winner!
-        // --- FIXED: Use uint for atomic operation. Store global_id, not full nonce ---
+        // Atomically write our global_id (if no one else has)
         if (atomic_cmpxchg(result_local_id, (uint)(-1), (uint)global_id) == (uint)(-1)) {
             // We were first! Write our hash to the output buffer.
             for(int i=0; i < 32; i++) {
@@ -301,7 +265,6 @@ __kernel void find_hash_kernel(
 // How many hashes to run on the GPU in a single batch.
 // 10 million is a good starting point. Tune this for your GPU.
 const GLOBAL_WORK_SIZE: usize = 10_485_760;
-// --- FIXED: Use u32::MAX for the 32-bit result buffer ---
 const NO_RESULT: u32 = u32::MAX;
 
 /// The GpuMiner struct holds the persistent OpenCL objects.
@@ -309,18 +272,14 @@ pub struct GpuMiner {
     context: Context,
     queue: Queue,
     kernel: Kernel,
-    // --- FIXED: Removed unused device field ---
-    // device: Device,
 }
 
 impl GpuMiner {
     /// Creates a new GpuMiner, finds the device, and compiles the kernel.
     pub fn new() -> OclResult<Self> {
-        // 1. Find a GPU platform and device
         let platform = Platform::default();
         let device = Device::list_all(platform)?
             .into_iter()
-            // --- FIXED: Use `if let` to pattern match the Result ---
             .find(|d| {
                 if let Ok(DeviceInfoResult::Type(device_type)) = d.info(DeviceInfo::Type) {
                     device_type == DeviceType::GPU
@@ -332,52 +291,49 @@ impl GpuMiner {
 
         println!("[GPU] Using OpenCL device: {}", device.name()?);
 
-        // 2. Create OpenCL context and command queue
-        // --- FIXED: Removed the ambiguous `.into()` call ---
         let context = Context::builder().devices(device).build()?;
         let queue = Queue::new(&context, device, None)?;
 
-        // 3. Compile the OpenCL kernel
         let program = ProgramBuilder::new()
             .devices(device)
             .src(OPENCL_KERNEL_SRC)
             .build(&context)?;
 
-        // --- FIXED: Prime the kernel builder with all 6 argument types ---
         let kernel = Kernel::builder()
             .program(&program)
             .name("find_hash_kernel")
             .queue(queue.clone())
-            .arg_named("base_line", None::<&Buffer<u8>>) // Arg 0
-            .arg_named("base_len", 0i32) // Arg 1
-            .arg_named("start_nonce", 0u64) // Arg 2
-            .arg_named("difficulty", 0u32) // Arg 3
-            .arg_named("result_local_id", None::<&Buffer<u32>>) // Arg 4
-            .arg_named("result_hash", None::<&Buffer<u8>>) // Arg 5
+            .arg_named("base_line", None::<&Buffer<u8>>)
+            .arg_named("base_len", 0i32)
+            .arg_named("start_nonce", 0u64)
+            .arg_named("difficulty", 0u32)
+            .arg_named("result_local_id", None::<&Buffer<u32>>)
+            .arg_named("result_hash", None::<&Buffer<u8>>)
             .build()?;
 
         Ok(GpuMiner {
             context,
             queue,
             kernel,
-            // --- FIXED: Removed unused device field ---
-            // device,
         })
     }
 
+    /// --- MODIFIED: Updated signature and return type ---
     /// Finds a seed using the GPU.
+    /// Returns `Ok(Some((seed, hash)))` if found.
+    /// Returns `Ok(None)` if interrupted by `stop_signal`.
+    /// Returns `Err` if an OpenCL error occurs.
     pub fn find_seed_gpu(
         &mut self,
         base_line: &str,
         difficulty: usize,
-    ) -> OclResult<(String, String)> {
+        stop_signal: Arc<AtomicBool>,
+    ) -> OclResult<Option<(String, String)>> {
         let start_time = Instant::now();
         let mut start_nonce: u64 = rand::random();
         let base_len = base_line.len();
 
         // --- Create GPU Buffers ---
-
-        // 1. Input: The base string ("parent name ")
         let base_line_buf = Buffer::builder()
             .context(&self.context)
             .flags(MemFlags::READ_ONLY | MemFlags::COPY_HOST_PTR)
@@ -385,32 +341,40 @@ impl GpuMiner {
             .copy_host_slice(base_line.as_bytes())
             .build()?;
 
-        // 2. Output: The winning nonce.
-        // --- FIXED: Changed to Buffer<u32> for the local_id ---
         let result_local_id_buf: Buffer<u32> = Buffer::builder()
             .context(&self.context)
             .flags(MemFlags::WRITE_ONLY | MemFlags::COPY_HOST_PTR)
-            .len(1) // one u32
+            .len(1)
             .copy_host_slice(&[NO_RESULT])
             .build()?;
 
-        // 3. Output: The winning hash (32 bytes)
         let result_hash_buf: Buffer<u8> = Buffer::builder()
             .context(&self.context)
             .flags(MemFlags::WRITE_ONLY)
-            .len(32) // 32 u8s
+            .len(32)
             .build()?;
 
         println!("[GPU] Starting hash search with batch size {GLOBAL_WORK_SIZE}...");
 
         // --- Main Mining Loop ---
         loop {
+            // --- ADDED: Check stop signal before starting batch ---
+            if stop_signal.load(Ordering::Relaxed) {
+                println!("[GPU] Stop signal received. Aborting work.");
+                return Ok(None); // Interrupted
+            }
+
+            // Reset the "found" buffer for this new batch
+            result_local_id_buf
+                .write(&[NO_RESULT; 1][..]) // <-- FIXED: Added [..] to create a slice
+                .queue(&self.queue)
+                .enq()?;
+
             // Set kernel arguments
             self.kernel.set_arg(0, &base_line_buf)?;
             self.kernel.set_arg(1, base_len as i32)?;
             self.kernel.set_arg(2, start_nonce)?;
             self.kernel.set_arg(3, difficulty as u32)?;
-            // --- FIXED: Pass the u32 buffer ---
             self.kernel.set_arg(4, &result_local_id_buf)?;
             self.kernel.set_arg(5, &result_hash_buf)?;
 
@@ -424,7 +388,6 @@ impl GpuMiner {
             }
 
             // Read back the result nonce
-            // --- FIXED: Read into a u32 buffer ---
             let mut result_local_id = [NO_RESULT; 1];
             result_local_id_buf
                 .read(&mut result_local_id[..])
@@ -436,35 +399,48 @@ impl GpuMiner {
 
             // --- Check if we found a solution ---
             if result_local_id[0] != NO_RESULT {
-                // --- FIXED: Reconstruct the full 64-bit nonce ---
-                let found_nonce = start_nonce + (result_local_id[0] as u64);
-                let seed_str = format!("{:x}", found_nonce);
+                // --- ADDED: Atomic check before claiming victory ---
+                // Try to set the stop_signal. If we succeed, we were first!
+                if stop_signal
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    // We were first! Read the hash and return.
+                    let found_nonce = start_nonce + (result_local_id[0] as u64);
+                    let seed_str = format!("{:x}", found_nonce);
 
-                // Read the hash string back
-                let mut hash_bytes = [0u8; 32];
-                result_hash_buf
-                    .read(&mut hash_bytes[..])
-                    .queue(&self.queue)
-                    .enq()?;
+                    let mut hash_bytes = [0u8; 32];
+                    result_hash_buf
+                        .read(&mut hash_bytes[..])
+                        .queue(&self.queue)
+                        .enq()?;
 
-                let hash_hex = hex::encode(hash_bytes);
-                let duration = start_time.elapsed();
-                let hashes_done = start_nonce + GLOBAL_WORK_SIZE as u64;
-                let hash_rate = (hashes_done as f64) / duration.as_secs_f64();
+                    let hash_hex = hex::encode(hash_bytes);
+                    let duration = start_time.elapsed();
+                    let hashes_done = TOTAL_HASHES.load(Ordering::Relaxed); // Read total
+                    let hash_rate = (hashes_done as f64) / duration.as_secs_f64();
 
-                println!("\n+++ [GPU] Found valid seed! +++");
-                println!("    Nonce: {}", found_nonce);
-                println!("    Seed:  {}", seed_str);
-                println!("    Hash:  {} (Bits: ?)", hash_hex);
-                println!(
-                    "    Perf:  {} hashes in {:?} ({:.2} MH/s)",
-                    hashes_done,
-                    duration,
-                    hash_rate / 1_000_000.0
-                );
+                    println!("\n+++ [GPU] Found valid seed! +++");
+                    println!("    Nonce: {}", found_nonce);
+                    println!("    Seed:  {}", seed_str);
+                    println!("    Hash:  {} (Bits: ?)", hash_hex);
+                    println!(
+                        "    Perf:  {} hashes in {:?} ({:.2} MH/s)",
+                        hashes_done,
+                        duration,
+                        hash_rate / 1_000_000.0
+                    );
 
-                // Return the (seed, hash_hex) tuple
-                return Ok((seed_str, hash_hex));
+                    // Return the (seed, hash_hex) tuple
+                    return Ok(Some((seed_str, hash_hex)));
+                } else {
+                    // --- This is the race condition ---
+                    // Our kernel found a hash, but *at the same time*
+                    // the checker thread set the stop_signal.
+                    // We must discard our result as it's now stale.
+                    println!("[GPU] Found hash, but was interrupted. Discarding.");
+                    return Ok(None); // Interrupted
+                }
             }
 
             // No solution found in this batch, prepare for the next

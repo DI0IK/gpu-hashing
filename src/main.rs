@@ -1,31 +1,5 @@
-/*
-A Rust-based hashing game client, rewritten from the Java original.
-
-This version has been updated to support BOTH:
-1. CPU Mining (using `rayon` for all cores)
-2. GPU Mining (using `ocl` for OpenCL devices)
-
-Set the `USE_GPU` const in `main()` to switch between them.
-
-It also includes a 5-second logging thread to report the
-combined hash rate from all miners.
-
-== How to Compile ==
-1. Install Rust: https://www.rust-lang.org/tools/install
-2. (For GPU) Install OpenCL drivers for your GPU:
-   - NVIDIA: Install the "CUDA Toolkit" (includes OpenCL)
-   - AMD: Install the latest "AMD Software: Adrenalin Edition"
-   - Intel: Install the "Intel SDK for OpenCL"
-3. Create a new project: `cargo new rust_miner`
-4. Enter the project: `cd rust_miner`
-5. Copy `Cargo.toml` into your `Cargo.toml`
-6. Create `src/gpu_miner.rs` and copy the code into it.
-7. Copy this code into `src/main.rs`
-8. Run: `cargo run --release` (release mode is crucial for performance)
-
-*/
-
 use rand::{thread_rng, Rng};
+use rayon::iter::ParallelIterator;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -33,28 +7,27 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-// --- FIXED: Removed unused prelude ---
-// use rayon::prelude::*;
-// --- ADDED: Use rayon's parallel iterator trait ---
-use rayon::iter::ParallelIterator;
 
-// --- ADDED ---
-// This brings the new `gpu_miner.rs` file into our project as a module.
 mod gpu_miner;
 
 // Use lazy_static to create a global, mutable timestamp for rate limiting.
 lazy_static::lazy_static! {
     static ref LAST_REQUEST: Mutex<Instant> = Mutex::new(Instant::now() - Duration::from_secs(5));
-    // --- ADDED: Global counter for hashes ---
     pub static ref TOTAL_HASHES: AtomicU64 = AtomicU64::new(0);
 }
 
 const SERVER_URL: &str = "http://hash.h10a.de/?raw";
 const MIN_REQUEST_GAP: Duration = Duration::from_millis(2100);
+// --- ADDED: How often to check for a new parent hash ---
+const CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+// --- MODIFIED: HashClient is now Clone ---
+// We need to clone it for the new checker thread.
+#[derive(Clone)]
 struct HashClient {
-    http_client: Client,
-    name: String,
+    // --- MODIFIED: Use Arc to allow cheap cloning ---
+    http_client: Arc<Client>,
+    name: Arc<String>,
 }
 
 #[derive(Debug)]
@@ -85,14 +58,16 @@ fn count_zero_bits(bytes: &[u8]) -> usize {
 impl HashClient {
     fn new(name: String) -> Self {
         HashClient {
-            http_client: Client::new(),
-            name,
+            // --- MODIFIED: Wrap in Arc ---
+            http_client: Arc::new(Client::new()),
+            name: Arc::new(name),
         }
     }
 
     /// Creates the input string to be hashed: "parent name seed"
     fn get_line(&self, parent: &str, seed: &str) -> String {
-        format!("{} {} {}", parent, self.name, seed)
+        // --- MODIFIED: Dereference Arc<String> ---
+        format!("{} {} {}", parent, *self.name, seed)
     }
 
     /// Performs a single SHA-256 hash.
@@ -137,7 +112,8 @@ impl HashClient {
             .trim()
             .parse::<usize>()
             .map_err(|e| format!("Failed to parse difficulty: {}", e))?;
-        println!("[Net] Difficulty: {}", difficulty);
+        // --- MODIFIED: Don't print, too noisy for checker
+        // println!("[Net] Difficulty: {}", difficulty);
 
         // 2. Parse Parent Hash
         let mut best_level = -1;
@@ -158,10 +134,11 @@ impl HashClient {
         if parent_hash.is_empty() {
             Err("Failed to find a parent hash from server response".to_string())
         } else {
-            println!(
-                "[Net] New parent hash: {} (Level: {})",
-                parent_hash, best_level
-            );
+            // --- MODIFIED: Don't print, too noisy for checker
+            // println!(
+            //     "[Net] New parent hash: {} (Level: {})",
+            //     parent_hash, best_level
+            // );
             Ok(ServerState {
                 difficulty,
                 parent_hash,
@@ -178,12 +155,24 @@ impl HashClient {
     fn send_seed(&self, parent: &str, seed: &str) -> Result<ServerState, String> {
         println!("[Net] Submitting seed to server...");
         let url = format!("{}&Z={}&P={}&R={}", SERVER_URL, parent, self.name, seed);
-        self.get_server_state(&url)
+        // --- MODIFIED: Call get_server_state and print results here ---
+        let result = self.get_server_state(&url);
+        if let Ok(state) = &result {
+            println!("[Net] Difficulty: {}", state.difficulty);
+            println!("[Net] New parent hash: {}", state.parent_hash);
+        }
+        result
     }
 
+    /// --- MODIFIED: Updated signature and return type ---
     /// Finds a valid seed by parallel searching across all CPU cores.
-    /// (Renamed from `find_seed` to `find_seed_cpu`)
-    fn find_seed_cpu(&self, parent: &str, difficulty: usize) -> (String, String) {
+    /// Returns `Some((seed, hash))` if found, `None` if interrupted.
+    fn find_seed_cpu(
+        &self,
+        parent: &str,
+        difficulty: usize,
+        stop_signal: Arc<AtomicBool>,
+    ) -> Option<(String, String)> {
         println!(
             "[CPU] Finding seed for parent {} with difficulty {} (using {} threads)...",
             parent,
@@ -191,71 +180,57 @@ impl HashClient {
             rayon::current_num_threads()
         );
 
-        // --- FIXED: Replaced AtomicOption with a simple Mutex ---
-        // This will store Some((seed, hash_hex)) once found.
         let result = Arc::new(Mutex::new(None::<(String, String)>));
-        // This Atomic is a flag to tell other threads to stop working.
-        let found = Arc::new(AtomicBool::new(false));
 
-        // --- FIXED: Use `rayon::iter::repeat` for a parallel infinite iterator ---
-        // --- FIXED: Clone the Arc `result` for the closure ---
-        rayon::iter::repeat(()).for_each_with(
-            (result.clone(), found),
-            |(result_clone, found_clone), _| {
-                // Check if another thread has already found a solution.
-                if found_clone.load(Ordering::SeqCst) {
-                    return; // Stop this thread's work
-                }
-
-                // Get a thread-local random number generator.
-                let mut rng = thread_rng();
-                // Generate a random u64 and format it as a hex string.
-                let seed = format!("{:x}", rng.gen::<u64>());
-
-                // Perform the hash
-                let hash_bytes = self.hash(parent, &seed);
-                let bits = count_zero_bits(&hash_bytes);
-
-                // --- ADDED: Increment global hash counter ---
-                TOTAL_HASHES.fetch_add(1, Ordering::Relaxed);
-
-                // Check if we found a valid hash
-                if bits >= difficulty {
-                    // Try to set the 'found' flag.
-                    if found_clone
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        let hash_hex = hex::encode(&hash_bytes);
-                        println!(
-                            "\n+++ [CPU] Found valid seed! (Thread {}) +++",
-                            rayon::current_thread_index().unwrap_or(0)
-                        );
-                        println!("    Seed: {}", seed);
-                        println!("    Hash: {} (Bits: {})", hash_hex, bits);
-
-                        // --- FIXED: Store the result in the Mutex ---
-                        let mut res_guard = result_clone.lock().unwrap();
-                        *res_guard = Some((seed, hash_hex));
-                    }
-                }
-            },
-        );
-
-        // --- FIXED: Wait for the Mutex to be populated ---
-        loop {
-            // Check if the Option inside the Mutex is Some
-            if let Some(res) = result.lock().unwrap().clone() {
-                // clone the (String, String) out and return it
-                return res;
+        // --- MODIFIED: Use `for_each_with` to pass in `result` ---
+        rayon::iter::repeat(()).for_each_with(result.clone(), |result_clone, _| {
+            // --- MODIFIED: Check the external stop_signal ---
+            if stop_signal.load(Ordering::Relaxed) {
+                return; // Stop this thread's work
             }
-            // Yield to the scheduler to avoid a busy-wait spin
-            thread::sleep(Duration::from_millis(10));
-        }
+
+            // Get a thread-local random number generator.
+            let mut rng = thread_rng();
+            // Generate a random u64 and format it as a hex string.
+            let seed = format!("{:x}", rng.gen::<u64>());
+
+            // Perform the hash
+            let hash_bytes = self.hash(parent, &seed);
+            let bits = count_zero_bits(&hash_bytes);
+
+            TOTAL_HASHES.fetch_add(1, Ordering::Relaxed);
+
+            // Check if we found a valid hash
+            if bits >= difficulty {
+                // --- MODIFIED: Use the stop_signal as the "found" flag ---
+                // Try to set the 'stop' flag. This tells all other threads
+                // (CPU) and the checker thread to stop.
+                if stop_signal
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let hash_hex = hex::encode(&hash_bytes);
+                    println!(
+                        "\n+++ [CPU] Found valid seed! (Thread {}) +++",
+                        rayon::current_thread_index().unwrap_or(0)
+                    );
+                    println!("    Seed: {}", seed);
+                    println!("    Hash: {} (Bits: {})", hash_hex, bits);
+
+                    let mut res_guard = result_clone.lock().unwrap();
+                    *res_guard = Some((seed, hash_hex));
+                }
+            }
+        });
+
+        // --- MODIFIED: Return the content of the Mutex ---
+        // It will be `Some` if we found it, or `None` if we were stopped.
+        let final_result = result.lock().unwrap().clone();
+        final_result
     }
 }
 
-// --- ADDED: Helper function for formatting hash rate ---
+/// --- ADDED: Helper function for formatting hash rate ---
 fn format_hash_rate(rate: f64) -> String {
     if rate < 1_000.0 {
         format!("{:.2} H/s", rate)
@@ -268,23 +243,70 @@ fn format_hash_rate(rate: f64) -> String {
     }
 }
 
+/// --- ADDED: Spawns the checker thread ---
+/// This thread polls the server and sets `stop_signal` if the parent changes.
+fn spawn_checker_thread(
+    client: HashClient,
+    current_parent: String,
+    stop_signal: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        loop {
+            // 1. Check if we should stop (e.g., miner found a solution)
+            if stop_signal.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // 2. Sleep for the interval
+            // --- MODIFIED: Sleep in small chunks to be responsive ---
+            let sleep_end = Instant::now() + CHECK_INTERVAL;
+            while Instant::now() < sleep_end {
+                if stop_signal.load(Ordering::Relaxed) {
+                    return; // Exit immediately
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            // 3. Check the server
+            match client.get_latest_parent() {
+                Ok(state) => {
+                    // 4. Compare parent hash
+                    if state.parent_hash != current_parent {
+                        println!(
+                            "\n[Net] Stale parent detected! Server parent is {}, we are on {}.",
+                            state.parent_hash, current_parent
+                        );
+                        // 5. Signal the miner to stop
+                        if stop_signal
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            println!("[Net] Stop signal sent to miner.");
+                        }
+                        break; // Stop this checker thread
+                    } else {
+                        // println!("[Net] Parent check OK."); // Uncomment for debugging
+                    }
+                }
+                Err(e) => {
+                    println!("[Net] Checker thread error: {}. Ignoring.", e);
+                }
+            }
+        }
+    })
+}
+
 fn main() {
     // --- CHOOSE YOUR MINER ---
-    // `true` = Use OpenCL GPU Miner
-    // `false` = Use Rayon CPU Miner
     const USE_GPU: bool = true;
     // -------------------------
 
     // --- ADDED: Spawn hash rate logging thread ---
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(5));
-            // Atomically read the count and reset it to 0
-            let hashes = TOTAL_HASHES.swap(0, Ordering::SeqCst);
-            // Calculate rate (hashes per second)
-            let rate = (hashes as f64) / 5.0;
-            println!("[Stats] Local hash rate: {}", format_hash_rate(rate));
-        }
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(5));
+        let hashes = TOTAL_HASHES.swap(0, Ordering::SeqCst);
+        let rate = (hashes as f64) / 5.0;
+        println!("[Stats] Local hash rate: {}", format_hash_rate(rate));
     });
     // ---------------------------------------------
 
@@ -293,17 +315,11 @@ fn main() {
         s.to_string_lossy().to_string()
     });
 
-    // Allow overriding name with an environment variable
     if let Ok(env_name) = std::env::var("HASH_NAME") {
         if !env_name.is_empty() {
             name = env_name;
         }
     }
-
-    // ---
-    // --- Set your nickname here if you don't want to use hostname:
-    // name = "MyMiner".to_string();
-    // ---
 
     println!("Starting Rust HashClient...");
     println!("Using name: {}", name);
@@ -313,9 +329,6 @@ fn main() {
     let mut current_difficulty: usize;
 
     // --- ADDED: Initialize GPU Miner (if selected) ---
-    // This is a bit of a trick: we create an `Option` to hold the miner.
-    // `gpu_miner::GpuMiner::new()` will find the GPU and compile the kernel.
-    // This can take a few seconds, so we do it once at the start.
     let mut gpu_miner_instance = if USE_GPU {
         println!("[GPU] Initializing OpenCL GPU miner...");
         match gpu_miner::GpuMiner::new() {
@@ -337,6 +350,8 @@ fn main() {
     // Get initial parent
     match client.get_latest_parent() {
         Ok(state) => {
+            println!("[Net] Difficulty: {}", state.difficulty);
+            println!("[Net] New parent hash: {}", state.parent_hash);
             current_parent = state.parent_hash;
             current_difficulty = state.difficulty;
         }
@@ -348,66 +363,100 @@ fn main() {
 
     // Main game loop
     loop {
-        // --- MODIFIED: Choose CPU or GPU path ---
-        let (seed, our_hash_hex) = if let Some(miner) = &mut gpu_miner_instance {
+        // --- MODIFIED: Main loop logic completely rewritten ---
+
+        // 1. Create a new stop signal for this round
+        let stop_signal = Arc::new(AtomicBool::new(false));
+
+        // 2. Spawn the checker thread
+        let checker_handle =
+            spawn_checker_thread(client.clone(), current_parent.clone(), stop_signal.clone());
+
+        // 3. Start the miner
+        let mining_result = if let Some(miner) = &mut gpu_miner_instance {
             // --- GPU Path ---
             println!(
                 "[GPU] Finding seed for parent {} with difficulty {}...",
                 current_parent, current_difficulty
             );
-            // We create the "base" string for the GPU: "parent name "
             let base_line = client.get_line(&current_parent, "");
 
-            match miner.find_seed_gpu(&base_line, current_difficulty) {
-                Ok(gpu_result) => {
-                    // gpu_result is (seed, hash_hex)
-                    gpu_result
-                }
+            // --- MODIFIED: Call new GPU function & handle OclResult ---
+            match miner.find_seed_gpu(&base_line, current_difficulty, stop_signal.clone()) {
+                Ok(Some(result)) => Some(result), // Found
+                Ok(None) => None,                 // Interrupted
                 Err(e) => {
                     eprintln!(
                         "[GPU] GPU miner failed: {}. Falling back to CPU for this round.",
                         e
                     );
                     // Fallback to CPU
-                    client.find_seed_cpu(&current_parent, current_difficulty)
+                    client.find_seed_cpu(&current_parent, current_difficulty, stop_signal.clone())
                 }
             }
         } else {
             // --- CPU Path (Original) ---
-            client.find_seed_cpu(&current_parent, current_difficulty)
+            client.find_seed_cpu(&current_parent, current_difficulty, stop_signal.clone())
         };
-        // -----------------------------------------
 
-        // 2. Submit the seed to the server
-        match client.send_seed(&current_parent, &seed) {
-            Ok(new_state) => {
-                // 3. Verify the server accepted our hash
-                if new_state.parent_hash == our_hash_hex {
-                    println!(
-                        "[Net] Server accepted our hash! New parent is: {}",
-                        new_state.parent_hash
-                    );
-                } else {
-                    println!("[Net] !!! Server did NOT accept our hash (someone was faster). !!!");
-                    println!("    Our hash:   {}", our_hash_hex);
-                    println!("    New parent: {}", new_state.parent_hash);
+        // 4. Stop the checker thread
+        // (It may have already stopped, this is safe)
+        stop_signal.store(true, Ordering::SeqCst);
+        checker_handle.join().unwrap(); // Wait for it to exit
+
+        // 5. Process the result
+        if let Some((seed, our_hash_hex)) = mining_result {
+            // --- We found a hash! ---
+            // 5a. Submit the seed to the server
+            match client.send_seed(&current_parent, &seed) {
+                Ok(new_state) => {
+                    // 5b. Verify if we won the round
+                    if new_state.parent_hash == our_hash_hex {
+                        println!(
+                            "[Net] Server accepted our hash! New parent is: {}",
+                            new_state.parent_hash
+                        );
+                    } else {
+                        println!(
+                            "[Net] !!! Server did NOT accept our hash (someone was faster). !!!"
+                        );
+                        println!("    Our hash:   {}", our_hash_hex);
+                        println!("    New parent: {}", new_state.parent_hash);
+                    }
+                    // Update state for the next round
+                    current_parent = new_state.parent_hash;
+                    current_difficulty = new_state.difficulty;
                 }
-                // Update state for the next round
-                current_parent = new_state.parent_hash;
-                current_difficulty = new_state.difficulty;
+                Err(e) => {
+                    eprintln!("[Net] Error submitting seed: {}. Retrying...", e);
+                    // On error, just try to get the latest parent and continue
+                    match client.get_latest_parent() {
+                        Ok(state) => {
+                            println!("[Net] Difficulty: {}", state.difficulty);
+                            println!("[Net] New parent hash: {}", state.parent_hash);
+                            current_parent = state.parent_hash;
+                            current_difficulty = state.difficulty;
+                        }
+                        Err(e) => {
+                            eprintln!("Fatal Error: Could not re-sync with server: {}", e);
+                            thread::sleep(Duration::from_secs(10)); // Wait before retrying
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("[Net] Error submitting seed: {}. Retrying...", e);
-                // On error, just try to get the latest parent and continue
-                match client.get_latest_parent() {
-                    Ok(state) => {
-                        current_parent = state.parent_hash;
-                        current_difficulty = state.difficulty;
-                    }
-                    Err(e) => {
-                        eprintln!("Fatal Error: Could not re-sync with server: {}", e);
-                        thread::sleep(Duration::from_secs(10)); // Wait before retrying
-                    }
+        } else {
+            // --- We were interrupted by the checker ---
+            println!("[Main] Miner interrupted (stale parent). Fetching new parent...");
+            match client.get_latest_parent() {
+                Ok(state) => {
+                    println!("[Net] Difficulty: {}", state.difficulty);
+                    println!("[Net] New parent hash: {}", state.parent_hash);
+                    current_parent = state.parent_hash;
+                    current_difficulty = state.difficulty;
+                }
+                Err(e) => {
+                    eprintln!("Fatal Error: Could not re-sync with server: {}", e);
+                    thread::sleep(Duration::from_secs(10)); // Wait before retrying
                 }
             }
         }
