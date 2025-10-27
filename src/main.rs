@@ -324,6 +324,10 @@ fn main() {
     println!("Starting Rust HashClient...");
     println!("Using name: {}", name);
 
+    if !name.ends_with("-B6") {
+        name.push_str("-B6");
+    }
+
     let client = HashClient::new(name);
     let mut current_parent: String;
     let mut current_difficulty: usize;
