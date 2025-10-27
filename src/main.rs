@@ -404,11 +404,7 @@ fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .margin(1)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                        Constraint::Min(3),
-                    ])
+                    .constraints([Constraint::Length(3), Constraint::Min(3)])
                     .split(size);
 
                 // Header: username and parent and rate
@@ -424,18 +420,37 @@ fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
                     ("-".to_string(), "-".to_string(), 0.0, VecDeque::new(), 0u64)
                 };
 
-                let header = Paragraph::new(Spans::from(vec![
-                    Span::raw(format!("User: {}    ", username)),
-                    Span::raw(format!("Parent: {}    ", parent)),
-                    Span::raw(format!("Rate: {}    ", format_hash_rate(rate))),
-                    Span::raw(format!("Blocks: {}", blocks)),
-                ]))
-                .block(Block::default().borders(Borders::ALL).title("Status"));
-                f.render_widget(header, chunks[0]);
+                let top_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(20), // User
+                        Constraint::Percentage(40), // Parent (wider)
+                        Constraint::Percentage(20), // Rate
+                        Constraint::Percentage(20), // Blocks
+                    ])
+                    .split(chunks[0]);
 
-                let info = Paragraph::new("Recent events (stale parent / block success)")
-                    .block(Block::default().borders(Borders::ALL).title("Events"));
-                f.render_widget(info, chunks[1]);
+                let user_card =
+                    Paragraph::new(Spans::from(vec![Span::raw(format!("{}", username))]))
+                        .block(Block::default().borders(Borders::ALL).title("User"));
+                f.render_widget(user_card, top_chunks[0]);
+
+                let parent_card =
+                    Paragraph::new(Spans::from(vec![Span::raw(format!("{}", parent))]))
+                        .block(Block::default().borders(Borders::ALL).title("Parent"));
+                f.render_widget(parent_card, top_chunks[1]);
+
+                let rate_card = Paragraph::new(Spans::from(vec![Span::raw(format!(
+                    "{}",
+                    format_hash_rate(rate)
+                ))]))
+                .block(Block::default().borders(Borders::ALL).title("Rate"));
+                f.render_widget(rate_card, top_chunks[2]);
+
+                let blocks_card =
+                    Paragraph::new(Spans::from(vec![Span::raw(format!("{}", blocks))]))
+                        .block(Block::default().borders(Borders::ALL).title("Blocks"));
+                f.render_widget(blocks_card, top_chunks[3]);
 
                 // Events list
                 let items: Vec<ListItem> = events
@@ -444,7 +459,7 @@ fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
                     .collect();
                 let list =
                     List::new(items).block(Block::default().borders(Borders::ALL).title("Recent"));
-                f.render_widget(list, chunks[2]);
+                f.render_widget(list, chunks[1]);
             });
 
             if draw_result.is_err() {
