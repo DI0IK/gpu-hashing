@@ -1,266 +1,83 @@
 //! GPU Miner (OpenCL) Module
 //!
-//! --- MODIFIED ---
-//! This version is now "interruptible".
+//! --- MODIFIED (Midstate Optimization) ---
 //!
-//! `find_seed_gpu` now accepts an `Arc<AtomicBool> stop_signal`.
+//! This version implements a SHA-256 "midstate" optimization.
 //!
-//! 1.  It checks this signal *before* launching a new kernel batch.
-//!     If `true`, it immediately stops and returns `Ok(None)`.
+//! 1.  We split the OpenCL kernel into three parts:
+//!     - `sha256_init_update`: The SHA-256 logic up to processing
+//!       a partial block.
+//!     - `calculate_midstate_kernel`: A new kernel run *once per job*
+//!       on a *single thread*. It calculates the SHA-256 state
+//!       (the "midstate") after hashing the constant `base_line`.
+//!     - `find_hash_kernel`: The main mining kernel. It now
+//!       takes the `midstate` as input, copies it, and only
+//!       adds the unique `nonce_hex` before finalizing the hash.
 //!
-//! 2.  If the kernel *finds* a solution, the host code (Rust)
-//!     must "claim" victory by atomically setting `stop_signal`
-//!     from `false` to `true`.
+//! 2.  The Rust host `find_seed_gpu` is updated to:
+//!     - Create a new `midstate_buf` on the GPU.
+//!     - Call `calculate_midstate_kernel` once to populate it.
+//!     - Pass this `midstate_buf` to `find_hash_kernel` in the
+//!       main loop.
 //!
-//! 3.  If this atomic `compare_exchange` fails, it means the
-//!     checker thread *just* set the signal *at the same time*.
-//!     The miner then discards its (now stale) result and
-//!     returns `Ok(None)`.
+//! This saves millions of redundant hash calculations per batch.
 //!
 
 use crate::TOTAL_HASHES;
 use ocl::{
     builders::ProgramBuilder,
     enums::{DeviceInfo, DeviceInfoResult},
-    Buffer, Context, Device, DeviceType, Kernel, MemFlags, Platform, Queue, Result as OclResult,
+    // --- We still need OclPrm for the manual impl ---
+    traits::OclPrm,
+    Buffer,
+    Context,
+    Device,
+    DeviceType,
+    Kernel,
+    MemFlags,
+    Platform,
+    Queue,
+    Result as OclResult,
 };
-// --- ADDED: Need AtomicBool and Arc for the stop signal ---
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// The OpenCL C kernel. This is a small program compiled at runtime
-/// and sent to the GPU.
-const OPENCL_KERNEL_SRC: &str = r#"
-/*
- * OpenCL SHA-256 Kernel
- *
- * This code runs on the GPU. It includes a full SHA-256 implementation
- * and a helper to convert a ulong (u64) nonce into a hex string,
- * which is required by the game's hash format.
- */
+// --- ADDED: Define the SHA-256 Context Struct ---
+// This MUST match the `sha256_ctx` struct in the OpenCL kernel.
+// `OclPrm` allows this Rust struct to be sent to/from the GPU.
+//
+// --- MODIFIED: Added PartialEq, removed Default from derive ---
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+struct Sha256Ctx {
+    h: [u32; 8], // 32 bytes
+    m: [u8; 64], // 64 bytes
+    n: u64,      // 8 bytes
+} // Total: 104 bytes
 
-// --- SHA-256 Implementation (for OpenCL) ---
-// (This is a standard, compact SHA-256 implementation adapted for OpenCL)
-
-#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
-#define SHR(x, n) ((x) >> (n))
-#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define EP0(x) (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
-#define EP1(x) (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
-#define SIG0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ SHR(x, 3))
-#define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ SHR(x, 10))
-
-typedef struct {
-    uchar M[64];
-    uint H[8];
-    ulong N;
-} sha256_ctx;
-
-constant uint K[64] = {
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-};
-
-// --- End of SHA-256 ---
-
-
-// Helper to convert a ulong nonce to a 1-16 char hex string
-inline int ulong_to_hex(ulong n, char* out) {
-    const char hex_chars[] = "0123456789abcdef";
-    char buf[16];
-    int i = 0;
-
-    if (n == 0) {
-        out[0] = '0';
-        return 1;
-    }
-
-    while (n > 0) {
-        buf[i++] = hex_chars[n & 0xF];
-        n >>= 4;
-    }
-
-    for (int j = 0; j < i; j++) {
-        out[j] = buf[i - 1 - j];
-    }
-    return i;
-}
-
-
-// SHA-256 transform function
-void sha256_transform(sha256_ctx *ctx) {
-    uint W[64];
-    uint a, b, c, d, e, f, g, h;
-    
-    #pragma unroll
-    for (int i = 0, j = 0; i < 16; i++, j += 4) {
-        W[i] = (ctx->M[j] << 24) | (ctx->M[j + 1] << 16) | (ctx->M[j + 2] << 8) | ctx->M[j + 3];
-    }
-
-    #pragma unroll
-    for (int i = 16; i < 64; i++) {
-        W[i] = SIG1(W[i - 2]) + W[i - 7] + SIG0(W[i - 15]) + W[i - 16];
-    }
-
-    a = ctx->H[0]; b = ctx->H[1]; c = ctx->H[2]; d = ctx->H[3];
-    e = ctx->H[4]; f = ctx->H[5]; g = ctx->H[6]; h = ctx->H[7];
-
-    #pragma unroll
-    for (int i = 0; i < 64; i++) {
-        uint T1 = h + EP1(e) + CH(e, f, g) + K[i] + W[i];
-        uint T2 = EP0(a) + MAJ(a, b, c);
-        h = g; g = f; f = e; e = d + T1;
-        d = c; c = b; b = a; a = T1 + T2;
-    }
-
-    ctx->H[0] += a; ctx->H[1] += b; ctx->H[2] += c; ctx->H[3] += d;
-    ctx->H[4] += e; ctx->H[5] += f; ctx->H[6] += g; ctx->H[7] += h;
-}
-
-// Main SHA-256 function
-void sha256(const uchar* data, int len, uchar* hash_out) {
-    sha256_ctx ctx;
-    
-    ctx.H[0] = 0x6a09e667; ctx.H[1] = 0xbb67ae85; ctx.H[2] = 0x3c6ef372; ctx.H[3] = 0xa54ff53a;
-    ctx.H[4] = 0x510e527f; ctx.H[5] = 0x9b05688c; ctx.H[6] = 0x1f83d9ab; ctx.H[7] = 0x5be0cd19;
-    ctx.N = 0;
-
-    int pos = 0;
-    while(pos < len) {
-        int copy_len = min(64 - (int)(ctx.N % 64), len - pos);
-        
-        for(int i=0; i < copy_len; i++) {
-            ctx.M[(ctx.N % 64) + i] = data[pos + i];
-        }
-
-        ctx.N += copy_len;
-        pos += copy_len;
-
-        if ((ctx.N % 64) == 0) {
-            sha256_transform(&ctx);
-        }
-    }
-
-    // Padding
-    int n_mod_64 = (int)(ctx.N % 64);
-    ctx.M[n_mod_64++] = 0x80;
-    
-    if (n_mod_64 > 56) {
-        for(int i=n_mod_64; i < 64; i++) {
-            ctx.M[i] = 0;
-        }
-        sha256_transform(&ctx);
-        n_mod_64 = 0;
-    }
-    
-    for(int i=n_mod_64; i < 56; i++) {
-        ctx.M[i] = 0;
-    }
-    
-    ulong n_bits = ctx.N * 8;
-    ctx.M[56] = (uchar)(n_bits >> 56);
-    ctx.M[57] = (uchar)(n_bits >> 48);
-    ctx.M[58] = (uchar)(n_bits >> 40);
-    ctx.M[59] = (uchar)(n_bits >> 32);
-    ctx.M[60] = (uchar)(n_bits >> 24);
-    ctx.M[61] = (uchar)(n_bits >> 16);
-    ctx.M[62] = (uchar)(n_bits >> 8);
-    ctx.M[63] = (uchar)(n_bits);
-
-    sha256_transform(&ctx);
-    
-    for(int i = 0; i < 8; i++) {
-        hash_out[i*4 + 0] = (uchar)(ctx.H[i] >> 24);
-        hash_out[i*4 + 1] = (uchar)(ctx.H[i] >> 16);
-        hash_out[i*4 + 2] = (uchar)(ctx.H[i] >> 8);
-        hash_out[i*4 + 3] = (uchar)(ctx.H[i]);
-    }
-}
-
-
-// Helper to check for N leading zero bits
-inline int count_zero_bits_kernel(const uchar* hash, int difficulty) {
-    int bits = 0;
-    for (int i = 0; i < 32; i++) {
-        uchar byte = hash[i];
-        if (byte == 0) {
-            bits += 8;
-        } else {
-            uchar b = byte;
-            while ((b & 0x80) == 0) {
-                bits++;
-                b <<= 1;
-            }
-            break;
-        }
-        if (bits >= difficulty) break;
-    }
-    return bits;
-}
-
-
-/*
- * == The Main Kernel ==
- */
-__kernel void find_hash_kernel(
-    __global const uchar* base_line,
-    int base_len,
-    ulong start_nonce,
-    uint difficulty,
-    __global uint* result_local_id,
-    __global uchar* result_hash
-) {
-    ulong global_id = get_global_id(0);
-    ulong nonce = start_nonce + global_id;
-
-    // --- Optimization: Check if already found before doing any work ---
-    if (*result_local_id != (uint)(-1)) {
-        return;
-    }
-
-    // 1. Construct the input string: "parent_hash name nonce_hex"
-    uchar line[256];
-    
-    for(int i=0; i < base_len; i++) {
-        line[i] = base_line[i];
-    }
-
-    char nonce_hex[17];
-    int nonce_len = ulong_to_hex(nonce, nonce_hex);
-
-    for(int i=0; i < nonce_len; i++) {
-        line[base_len + i] = nonce_hex[i];
-    }
-    
-    int total_len = base_len + nonce_len;
-
-    // 2. Hash the constructed line
-    uchar hash_output[32];
-    sha256(line, total_len, hash_output);
-
-    // 3. Check if the hash meets the difficulty
-    int bits = count_zero_bits_kernel(hash_output, difficulty);
-
-    if (bits >= difficulty) {
-        // We found a winner!
-        // Atomically write our global_id (if no one else has)
-        if (atomic_cmpxchg(result_local_id, (uint)(-1), (uint)global_id) == (uint)(-1)) {
-            // We were first! Write our hash to the output buffer.
-            for(int i=0; i < 32; i++) {
-                result_hash[i] = hash_output[i];
-            }
+// --- ADDED: Manual Default implementation ---
+// This is required by the OclPrm trait bound, and we can't
+// derive it because of the [u8; 64] array.
+impl Default for Sha256Ctx {
+    fn default() -> Self {
+        Sha256Ctx {
+            h: [0; 8],
+            m: [0; 64],
+            n: 0,
         }
     }
 }
-"#;
+
+// --- ADDED: Manual (unsafe) trait implementation ---
+// SAFETY: This struct is `#[repr(C)]` and all its fields (u32, u8, u64)
+// are valid OclPrm types. It also now implements all required bounds:
+// Debug, Clone, Copy, Default, and PartialEq.
+unsafe impl OclPrm for Sha256Ctx {}
+
+// The OpenCL C kernel.
+// --- MODIFIED: See new kernel file ---
+const OPENCL_KERNEL_SRC: &str = include_str!("kernel.cl");
 
 // How many hashes to run on the GPU in a single batch.
 // 10 million is a good starting point. Tune this for your GPU.
@@ -271,7 +88,9 @@ const NO_RESULT: u32 = u32::MAX;
 pub struct GpuMiner {
     context: Context,
     queue: Queue,
-    kernel: Kernel,
+    // --- ADDED: We now need two kernels ---
+    midstate_kernel: Kernel,
+    find_hash_kernel: Kernel,
     // Human-friendly device name (e.g. GPU model)
     pub device_name: String,
 }
@@ -303,12 +122,24 @@ impl GpuMiner {
             .src(OPENCL_KERNEL_SRC)
             .build(&context)?;
 
-        let kernel = Kernel::builder()
+        // --- Kernel 1: The new midstate calculator ---
+        // (This code is now valid since Sha256Ctx implements OclPrm)
+        let midstate_kernel = Kernel::builder()
             .program(&program)
-            .name("find_hash_kernel")
+            .name("calculate_midstate_kernel")
             .queue(queue.clone())
             .arg_named("base_line", None::<&Buffer<u8>>)
             .arg_named("base_len", 0i32)
+            .arg_named("midstate_out", None::<&Buffer<Sha256Ctx>>) // Output
+            .build()?;
+
+        // --- Kernel 2: The main hash finder ---
+        // (This code is now valid since Sha256Ctx implements OclPrm)
+        let find_hash_kernel = Kernel::builder()
+            .program(&program)
+            .name("find_hash_kernel")
+            .queue(queue.clone())
+            .arg_named("midstate", None::<&Buffer<Sha256Ctx>>) // Input
             .arg_named("start_nonce", 0u64)
             .arg_named("difficulty", 0u32)
             .arg_named("result_local_id", None::<&Buffer<u32>>)
@@ -318,12 +149,13 @@ impl GpuMiner {
         Ok(GpuMiner {
             context,
             queue,
-            kernel,
+            midstate_kernel,
+            find_hash_kernel,
             device_name,
         })
     }
 
-    /// --- MODIFIED: Updated signature and return type ---
+    /// --- MODIFIED: Updated signature and logic ---
     /// Finds a seed using the GPU.
     /// Returns `Ok(Some((seed, hash)))` if found.
     /// Returns `Ok(None)` if interrupted by `stop_signal`.
@@ -346,6 +178,14 @@ impl GpuMiner {
             .copy_host_slice(base_line.as_bytes())
             .build()?;
 
+        // --- ADDED: Buffer to hold the single midstate struct ---
+        // (This code is now valid since Sha256Ctx implements OclPrm)
+        let midstate_buf: Buffer<Sha256Ctx> = Buffer::builder()
+            .context(&self.context)
+            .flags(MemFlags::READ_WRITE) // Written by kernel 1, read by kernel 2
+            .len(1)
+            .build()?; // We don't need to init with data, so .build() is fine
+
         let result_local_id_buf: Buffer<u32> = Buffer::builder()
             .context(&self.context)
             .flags(MemFlags::WRITE_ONLY | MemFlags::COPY_HOST_PTR)
@@ -359,13 +199,29 @@ impl GpuMiner {
             .len(32)
             .build()?;
 
+        // --- ADDED: Run Midstate Kernel *ONCE* ---
+        crate::events::publish_event("[GPU] Calculating midstate for new job...");
+        // (This code is now valid since Sha256Ctx implements OclPrm)
+        self.midstate_kernel.set_arg(0, &base_line_buf)?;
+        self.midstate_kernel.set_arg(1, base_len as i32)?;
+        self.midstate_kernel.set_arg(2, &midstate_buf)?;
+
+        unsafe {
+            self.midstate_kernel
+                .cmd()
+                .queue(&self.queue)
+                .global_work_size(1) // Run ONCE on ONE thread
+                .enq()?;
+        }
+        // --- Midstate is now calculated and lives in `midstate_buf` ---
+
         crate::events::publish_event(&format!(
             "[GPU] Starting hash search with batch size {GLOBAL_WORK_SIZE}..."
         ));
 
         // --- Main Mining Loop ---
         loop {
-            // --- ADDED: Check stop signal before starting batch ---
+            // --- Check stop signal (same as before) ---
             if stop_signal.load(Ordering::Relaxed) {
                 crate::events::publish_event("[GPU] Stop signal received. Aborting work.");
                 return Ok(None); // Interrupted
@@ -373,21 +229,21 @@ impl GpuMiner {
 
             // Reset the "found" buffer for this new batch
             result_local_id_buf
-                .write(&[NO_RESULT; 1][..]) // <-- FIXED: Added [..] to create a slice
+                .write(&[NO_RESULT; 1][..])
                 .queue(&self.queue)
                 .enq()?;
 
-            // Set kernel arguments
-            self.kernel.set_arg(0, &base_line_buf)?;
-            self.kernel.set_arg(1, base_len as i32)?;
-            self.kernel.set_arg(2, start_nonce)?;
-            self.kernel.set_arg(3, difficulty as u32)?;
-            self.kernel.set_arg(4, &result_local_id_buf)?;
-            self.kernel.set_arg(5, &result_hash_buf)?;
+            // --- Set kernel arguments (MODIFIED) ---
+            // (This code is now valid since Sha256Ctx implements OclPrm)
+            self.find_hash_kernel.set_arg(0, &midstate_buf)?; // Pass midstate
+            self.find_hash_kernel.set_arg(1, start_nonce)?;
+            self.find_hash_kernel.set_arg(2, difficulty as u32)?;
+            self.find_hash_kernel.set_arg(3, &result_local_id_buf)?;
+            self.find_hash_kernel.set_arg(4, &result_hash_buf)?;
 
-            // Launch the kernel
+            // Launch the main kernel (same as before)
             unsafe {
-                self.kernel
+                self.find_hash_kernel
                     .cmd()
                     .queue(&self.queue)
                     .global_work_size(GLOBAL_WORK_SIZE)
@@ -404,10 +260,9 @@ impl GpuMiner {
             // Report hashes for this batch
             TOTAL_HASHES.fetch_add(GLOBAL_WORK_SIZE as u64, Ordering::Relaxed);
 
-            // --- Check if we found a solution ---
+            // --- Check if we found a solution (same as before) ---
             if result_local_id[0] != NO_RESULT {
-                // --- ADDED: Atomic check before claiming victory ---
-                // Try to set the stop_signal. If we succeed, we were first!
+                // --- Atomic check before claiming victory (same as before) ---
                 if stop_signal
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                     .is_ok()
@@ -441,10 +296,7 @@ impl GpuMiner {
                     // Return the (seed, hash_hex) tuple
                     return Ok(Some((seed_str, hash_hex)));
                 } else {
-                    // --- This is the race condition ---
-                    // Our kernel found a hash, but *at the same time*
-                    // the checker thread set the stop_signal.
-                    // We must discard our result as it's now stale.
+                    // --- Race condition (same as before) ---
                     crate::events::publish_event(
                         "[GPU] Found hash, but was interrupted. Discarding.",
                     );
