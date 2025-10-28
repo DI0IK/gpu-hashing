@@ -272,6 +272,8 @@ pub struct GpuMiner {
     context: Context,
     queue: Queue,
     kernel: Kernel,
+    // Human-friendly device name (e.g. GPU model)
+    pub device_name: String,
 }
 
 impl GpuMiner {
@@ -289,7 +291,9 @@ impl GpuMiner {
             })
             .ok_or("No GPU device found")?;
 
-        crate::events::publish_event(&format!("[GPU] Using OpenCL device: {}", device.name()?));
+        // Capture the device name for UI display
+        let device_name = device.name()?;
+        crate::events::publish_event(&format!("[GPU] Using OpenCL device: {}", device_name));
 
         let context = Context::builder().devices(device).build()?;
         let queue = Queue::new(&context, device, None)?;
@@ -315,6 +319,7 @@ impl GpuMiner {
             context,
             queue,
             kernel,
+            device_name,
         })
     }
 

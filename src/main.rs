@@ -1,5 +1,5 @@
 use rand::{thread_rng, Rng};
-use rayon::iter::ParallelIterator;
+// rayon used for thread count; we don't need ParallelIterator here
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // TUI deps
-use crossterm::event::{Event as CEvent, KeyCode, KeyModifiers};
+use crossterm::event::{Event as CEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -63,6 +63,16 @@ struct UIState {
     hash_rate: f64,
     username: String,
     parent: String,
+    // Which device is being used (e.g. "CPU" or "GPU: GeForce ...")
+    device: String,
+    // When true, show the device selection menu overlay
+    show_device_menu: bool,
+    // Index of currently highlighted item in the device menu
+    device_menu_index: usize,
+    // Available device choices displayed in the menu
+    available_devices: Vec<String>,
+    // Last rendered device card rectangle (x, y, width, height) for mouse clicks
+    device_rect: Option<(u16, u16, u16, u16)>,
     total_blocks_mined: u64,
 }
 
@@ -86,13 +96,18 @@ fn save_blocks_mined_to_disk(n: u64) {
 }
 
 impl UIState {
-    fn new(username: String, parent: String) -> Self {
+    fn new(username: String, parent: String, device: String) -> Self {
         let total_blocks_mined = load_blocks_mined_from_disk();
         UIState {
-            recent_events: VecDeque::with_capacity(16),
+            recent_events: VecDeque::with_capacity(32),
             hash_rate: 0.0,
             username,
             parent,
+            device,
+            show_device_menu: false,
+            device_menu_index: 0,
+            available_devices: Vec::new(),
+            device_rect: None,
             total_blocks_mined,
         }
     }
@@ -143,14 +158,6 @@ impl HashClient {
     fn get_line(&self, parent: &str, seed: &str) -> String {
         // --- MODIFIED: Dereference Arc<String> ---
         format!("{} {} {}", parent, *self.name, seed)
-    }
-
-    /// Performs a single SHA-256 hash.
-    fn hash(&self, parent: &str, seed: &str) -> Vec<u8> {
-        let line = self.get_line(parent, seed);
-        let mut hasher = Sha256::new();
-        hasher.update(line.as_bytes());
-        hasher.finalize().to_vec()
     }
 
     /// Connects to the server (with rate-limiting) to get the current state.
@@ -260,50 +267,77 @@ impl HashClient {
 
         let result = Arc::new(Mutex::new(None::<(String, String)>));
 
-        // --- MODIFIED: Use `for_each_with` to pass in `result` ---
-        rayon::iter::repeat(()).for_each_with(result.clone(), |result_clone, _| {
-            // --- MODIFIED: Check the external stop_signal ---
-            if stop_signal.load(Ordering::Relaxed) {
-                return; // Stop this thread's work
-            }
+        // Capture client name for composing the line: "parent name seed"
+        let client_name = self.name.as_ref().to_string();
 
-            // Get a thread-local random number generator.
-            let mut rng = thread_rng();
-            // Generate a random u64 and format it as a hex string.
-            let seed = format!("{:x}", rng.gen::<u64>());
+        // Spawn worker threads (std::thread) so we can check the shared stop
+        // signal frequently and respond to aborts when switching devices.
+        let num_threads = rayon::current_num_threads();
+        let mut handles = Vec::with_capacity(num_threads);
 
-            // Perform the hash
-            let hash_bytes = self.hash(parent, &seed);
-            let bits = count_zero_bits(&hash_bytes);
+        for _ in 0..num_threads {
+            let parent = parent.to_string();
+            let cname = client_name.clone();
+            let stop = stop_signal.clone();
+            let result_clone = result.clone();
+            handles.push(thread::spawn(move || {
+                // Each thread uses its own RNG
+                let mut rng = thread_rng();
+                const BATCH: usize = 256; // check stop signal every BATCH hashes
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
 
-            TOTAL_HASHES.fetch_add(1, Ordering::Relaxed);
+                    for _ in 0..BATCH {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let seed = format!("{:x}", rng.gen::<u64>());
+                        let hash_bytes = {
+                            // compute the hash for this seed: "parent name seed"
+                            let mut hasher = Sha256::new();
+                            let line = format!("{} {} {}", parent, cname, seed);
+                            hasher.update(line.as_bytes());
+                            hasher.finalize().to_vec()
+                        };
+                        let bits = count_zero_bits(&hash_bytes);
 
-            // Check if we found a valid hash
-            if bits >= difficulty {
-                // --- MODIFIED: Use the stop_signal as the "found" flag ---
-                // Try to set the 'stop' flag. This tells all other threads
-                // (CPU) and the checker thread to stop.
-                if stop_signal
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    let hash_hex = hex::encode(&hash_bytes);
-                    events::publish_event(&format!(
-                        "+++ [CPU] Found valid seed! (Thread {}) Seed: {} Hash: {} (Bits: {})",
-                        rayon::current_thread_index().unwrap_or(0),
-                        seed,
-                        hash_hex,
-                        bits
-                    ));
+                        TOTAL_HASHES.fetch_add(1, Ordering::Relaxed);
 
-                    let mut res_guard = result_clone.lock().unwrap();
-                    *res_guard = Some((seed, hash_hex));
+                        if bits >= difficulty {
+                            // Try to claim victory by setting the stop flag.
+                            if stop
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                let hash_hex = hex::encode(&hash_bytes);
+                                events::publish_event(&format!(
+                                    "+++ [CPU] Found valid seed! Seed: {} Hash: {} (Bits: {})",
+                                    seed, hash_hex, bits
+                                ));
+                                let mut guard = result_clone.lock().unwrap();
+                                *guard = Some((seed, hash_hex));
+                                break;
+                            } else {
+                                // Another thread or the checker claimed it
+                                break;
+                            }
+                        }
+                    }
+
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
-            }
-        });
+            }));
+        }
 
-        // --- MODIFIED: Return the content of the Mutex ---
-        // It will be `Some` if we found it, or `None` if we were stopped.
+        // Wait for workers to finish
+        for h in handles {
+            let _ = h.join();
+        }
+
         let final_result = result.lock().unwrap().clone();
         final_result
     }
@@ -383,7 +417,10 @@ fn spawn_checker_thread(
 }
 
 /// Spawn a simple TUI that renders username, parent, hash rate and recent events.
-fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
+fn spawn_tui(
+    ui_state: Arc<Mutex<UIState>>,
+    shared_stop_signal: Arc<Mutex<Arc<AtomicBool>>>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Terminal setup
         let mut stdout = stdout();
@@ -408,25 +445,36 @@ fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
                     .split(size);
 
                 // Header: username and parent and rate
-                let (username, parent, rate, events, blocks) = if let Ok(ui) = ui_clone.lock() {
-                    (
-                        ui.username.clone(),
-                        ui.parent.clone(),
-                        ui.hash_rate,
-                        ui.recent_events.clone(),
-                        ui.total_blocks_mined,
-                    )
-                } else {
-                    ("-".to_string(), "-".to_string(), 0.0, VecDeque::new(), 0u64)
-                };
+                // Lock UIState (mutable) so we can also record the device card rectangle
+                let (username, parent, rate, device, events, blocks) =
+                    if let Ok(ui) = ui_clone.lock() {
+                        (
+                            ui.username.clone(),
+                            ui.parent.clone(),
+                            ui.hash_rate,
+                            ui.device.clone(),
+                            ui.recent_events.clone(),
+                            ui.total_blocks_mined,
+                        )
+                    } else {
+                        (
+                            "-".to_string(),
+                            "-".to_string(),
+                            0.0,
+                            "-".to_string(),
+                            VecDeque::new(),
+                            0u64,
+                        )
+                    };
 
                 let top_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Percentage(20), // User
+                        Constraint::Percentage(18), // User
                         Constraint::Percentage(40), // Parent (wider)
-                        Constraint::Percentage(20), // Rate
-                        Constraint::Percentage(20), // Blocks
+                        Constraint::Percentage(16), // Rate
+                        Constraint::Percentage(12), // Blocks
+                        Constraint::Percentage(14), // Device
                     ])
                     .split(chunks[0]);
 
@@ -452,6 +500,47 @@ fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
                         .block(Block::default().borders(Borders::ALL).title("Blocks"));
                 f.render_widget(blocks_card, top_chunks[3]);
 
+                let device_card =
+                    Paragraph::new(Spans::from(vec![Span::raw(format!("{}", device))]))
+                        .block(Block::default().borders(Borders::ALL).title("Device"));
+                f.render_widget(device_card, top_chunks[4]);
+
+                // Save the device card rectangle for mouse click detection
+                if let Ok(mut ui) = ui_clone.lock() {
+                    let rect = top_chunks[4];
+                    ui.device_rect = Some((rect.x, rect.y, rect.width, rect.height));
+                }
+
+                // If device menu is active, render a centered popup with choices
+                if let Ok(ui) = ui_clone.lock() {
+                    if ui.show_device_menu {
+                        let popup_width = 40u16.min(size.width.saturating_sub(4));
+                        let popup_height =
+                            (ui.available_devices.len() as u16).saturating_add(2).max(3);
+                        let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+                        let popup_y = (size.height.saturating_sub(popup_height)) / 2;
+
+                        let mut lines: Vec<Spans> = Vec::new();
+                        for (i, d) in ui.available_devices.iter().enumerate() {
+                            if i == ui.device_menu_index {
+                                lines.push(Spans::from(vec![Span::raw(format!("> {}", d))]));
+                            } else {
+                                lines.push(Spans::from(vec![Span::raw(format!("  {}", d))]));
+                            }
+                        }
+
+                        let popup = Paragraph::new(lines).block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Select Device"),
+                        );
+
+                        use tui::layout::Rect;
+                        let rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+                        f.render_widget(popup, rect);
+                    }
+                }
+
                 // Events list
                 let items: Vec<ListItem> = events
                     .iter()
@@ -469,19 +558,99 @@ fn spawn_tui(ui_state: Arc<Mutex<UIState>>) -> thread::JoinHandle<()> {
             // Poll for key events (200ms)
             if crossterm::event::poll(Duration::from_millis(200)).unwrap_or(false) {
                 if let Ok(ev) = crossterm::event::read() {
-                    if let CEvent::Key(key) = ev {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                APP_EXIT.store(true, Ordering::SeqCst);
-                                // exit entire process immediately to avoid blocked threads
-                                std::process::exit(0);
+                    match ev {
+                        CEvent::Key(key) => {
+                            // If the device menu is open, handle navigation and selection
+                            if let Ok(mut ui) = ui_clone.lock() {
+                                if ui.show_device_menu {
+                                    match key.code {
+                                        KeyCode::Down => {
+                                            if !ui.available_devices.is_empty() {
+                                                ui.device_menu_index = (ui.device_menu_index + 1)
+                                                    % ui.available_devices.len();
+                                            }
+                                        }
+                                        KeyCode::Up => {
+                                            if !ui.available_devices.is_empty() {
+                                                if ui.device_menu_index == 0 {
+                                                    ui.device_menu_index =
+                                                        ui.available_devices.len() - 1;
+                                                } else {
+                                                    ui.device_menu_index -= 1;
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Enter => {
+                                            if let Some(choice) =
+                                                ui.available_devices.get(ui.device_menu_index)
+                                            {
+                                                ui.device = choice.clone();
+                                                ui.show_device_menu = false;
+                                                events::publish_event(&format!(
+                                                    "Device selected: {}",
+                                                    ui.device
+                                                ));
+                                                // Signal the current miner to stop so main will restart with new device
+                                                if let Ok(shared) = shared_stop_signal.lock() {
+                                                    shared.store(true, Ordering::SeqCst);
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Esc => {
+                                            ui.show_device_menu = false;
+                                        }
+                                        _ => {}
+                                    }
+                                    continue; // menu handled
+                                }
                             }
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                APP_EXIT.store(true, Ordering::SeqCst);
-                                std::process::exit(0);
+
+                            // Global key bindings
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                    APP_EXIT.store(true, Ordering::SeqCst);
+                                    // exit entire process immediately to avoid blocked threads
+                                    std::process::exit(0);
+                                }
+                                KeyCode::Char('c')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    APP_EXIT.store(true, Ordering::SeqCst);
+                                    std::process::exit(0);
+                                }
+                                KeyCode::Char('d') => {
+                                    if let Ok(mut ui) = ui_clone.lock() {
+                                        ui.show_device_menu = true;
+                                        ui.device_menu_index = ui
+                                            .available_devices
+                                            .iter()
+                                            .position(|d| *d == ui.device)
+                                            .unwrap_or(0);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
+                        CEvent::Mouse(me) => {
+                            // Left-click on device card opens the device menu
+                            if matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                if let Ok(mut ui) = ui_clone.lock() {
+                                    if let Some((x, y, w, h)) = ui.device_rect {
+                                        let col = me.column as u16;
+                                        let row = me.row as u16;
+                                        if col >= x && col < x + w && row >= y && row < y + h {
+                                            ui.show_device_menu = true;
+                                            ui.device_menu_index = ui
+                                                .available_devices
+                                                .iter()
+                                                .position(|d| *d == ui.device)
+                                                .unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -549,7 +718,7 @@ fn main() {
 
     // --- ADDED: Initialize GPU Miner (if selected) ---
     let mut gpu_miner_instance = if USE_GPU {
-        println!("[GPU] Initializing OpenCL GPU miner...");
+        events::publish_event("[GPU] Initializing OpenCL GPU miner...");
         match gpu_miner::GpuMiner::new() {
             Ok(miner) => {
                 events::publish_event("[GPU] GPU Miner initialized successfully!");
@@ -578,16 +747,38 @@ fn main() {
             current_difficulty = state.difficulty;
         }
         Err(e) => {
-            eprintln!("Fatal Error: Could not get initial parent: {}", e);
+            events::publish_event(&format!("Fatal Error: Could not get initial parent: {}", e));
             return;
         }
     }
 
     // Create UI state and spawn the TUI and stats threads
+    // Determine selected device string for UI
+    let selected_device = if let Some(miner) = &gpu_miner_instance {
+        format!("GPU: {}", miner.device_name)
+    } else {
+        "CPU".to_string()
+    };
+
     let ui_state = Arc::new(Mutex::new(UIState::new(
         client.name.as_ref().to_string(),
         current_parent.clone(),
+        selected_device.clone(),
     )));
+
+    // Populate available devices for the device menu
+    if let Ok(mut ui) = ui_state.lock() {
+        ui.available_devices.clear();
+        ui.available_devices.push("CPU".to_string());
+        if let Some(miner) = &gpu_miner_instance {
+            ui.available_devices
+                .push(format!("GPU: {}", miner.device_name));
+        }
+        // Make sure current device is one of the available ones
+        if !ui.available_devices.iter().any(|d| d == &ui.device) {
+            ui.device = ui.available_devices[0].clone();
+        }
+    }
 
     // Create an event channel and initialize the global event sender
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<String>();
@@ -605,8 +796,13 @@ fn main() {
         });
     }
 
-    // Spawn TUI
-    let _tui_handle = spawn_tui(ui_state.clone());
+    // Create a shared holder for the current round's stop-signal so the TUI
+    // can request the running miner to stop when the user switches devices.
+    let shared_stop_signal: Arc<Mutex<Arc<AtomicBool>>> =
+        Arc::new(Mutex::new(Arc::new(AtomicBool::new(false))));
+
+    // Spawn TUI (give it access to the shared stop-signal)
+    let _tui_handle = spawn_tui(ui_state.clone(), shared_stop_signal.clone());
 
     // Spawn hash rate logging thread -> update UI state instead of printing
     {
@@ -622,16 +818,25 @@ fn main() {
     }
 
     // Main game loop
+    // Track the last-seen device to detect user switches
+    let mut previous_device = selected_device.clone();
+
     loop {
         // Exit if TUI requested quit
         if APP_EXIT.load(Ordering::Relaxed) {
-            println!("Exiting (requested by UI)");
+            events::publish_event("Exiting (requested by UI)");
             break;
         }
         // --- MODIFIED: Main loop logic completely rewritten ---
 
         // 1. Create a new stop signal for this round
         let stop_signal = Arc::new(AtomicBool::new(false));
+
+        // Publish this stop signal into the shared holder so the TUI can set it
+        // to request the miner be interrupted (e.g. when the user changes device).
+        if let Ok(mut holder) = shared_stop_signal.lock() {
+            *holder = stop_signal.clone();
+        }
 
         // 2. Spawn the checker thread
         let checker_handle = spawn_checker_thread(
@@ -640,6 +845,66 @@ fn main() {
             stop_signal.clone(),
             ui_state.clone(),
         );
+
+        // Honor device selection from the UI: switch GPU on/off as requested
+        let ui_device_choice = if let Ok(ui) = ui_state.lock() {
+            ui.device.clone()
+        } else {
+            "CPU".to_string()
+        };
+
+        // If the user changed device since last round, reset counters and notify
+        if ui_device_choice != previous_device {
+            events::publish_event(&format!(
+                "Switching device: {} -> {}",
+                previous_device, ui_device_choice
+            ));
+            // Reset total hashes so the displayed hash-rate quickly reflects the new device
+            TOTAL_HASHES.store(0, Ordering::SeqCst);
+            if let Ok(mut ui) = ui_state.lock() {
+                ui.hash_rate = 0.0;
+            }
+            previous_device = ui_device_choice.clone();
+        }
+
+        if ui_device_choice.starts_with("GPU") {
+            // Ensure we have a GPU miner instance; try to initialize on demand
+            if gpu_miner_instance.is_none() {
+                events::publish_event("[Main] User requested GPU — attempting to initialize...");
+                match gpu_miner::GpuMiner::new() {
+                    Ok(miner) => {
+                        events::publish_event("[GPU] GPU miner initialized on-demand.");
+                        let devname = miner.device_name.clone();
+                        gpu_miner_instance = Some(miner);
+                        // Update UI available devices and current device string
+                        if let Ok(mut ui) = ui_state.lock() {
+                            ui.available_devices.retain(|d| d != "GPU: Unknown");
+                            if !ui.available_devices.iter().any(|d| d.starts_with("GPU:")) {
+                                ui.available_devices.push(format!("GPU: {}", devname));
+                            }
+                            ui.device = format!("GPU: {}", devname);
+                        }
+                    }
+                    Err(e) => {
+                        events::publish_event(&format!(
+                            "[GPU] Failed to initialize GPU on-demand: {}. Staying on CPU.",
+                            e
+                        ));
+                        // Remove GPU option from available devices
+                        if let Ok(mut ui) = ui_state.lock() {
+                            ui.available_devices.retain(|d| !d.starts_with("GPU:"));
+                            ui.device = "CPU".to_string();
+                        }
+                    }
+                }
+            }
+        } else {
+            // User requested CPU — drop GPU instance if present
+            if gpu_miner_instance.is_some() {
+                events::publish_event("[Main] Switching to CPU per UI selection.");
+                gpu_miner_instance = None;
+            }
+        }
 
         // Determine effective difficulty for this round (may be overridden in debug)
         let effective_difficulty = if debug_enabled {
@@ -651,10 +916,10 @@ fn main() {
         // 3. Start the miner
         let mining_result = if let Some(miner) = &mut gpu_miner_instance {
             // --- GPU Path ---
-            println!(
+            events::publish_event(&format!(
                 "[GPU] Finding seed for parent {} with difficulty {}...",
-                current_parent, effective_difficulty
-            );
+                current_parent, effective_difficulty,
+            ));
             let base_line = client.get_line(&current_parent, "");
 
             // --- MODIFIED: Call new GPU function & handle OclResult ---
@@ -684,10 +949,10 @@ fn main() {
             // --- We found a hash! ---
             if debug_enabled {
                 // In debug mode we don't submit to server.
-                println!("[Debug] Found seed (not submitting):");
-                println!("    Parent: {}", current_parent);
-                println!("    Seed: {}", seed);
-                println!("    Hash: {}", our_hash_hex);
+                events::publish_event("[Debug] Found seed (not submitting):");
+                events::publish_event(&format!("    Parent: {}", current_parent));
+                events::publish_event(&format!("    Seed: {}", seed));
+                events::publish_event(&format!("    Hash: {}", our_hash_hex));
                 // Simulate acceptance locally by updating parent.
                 current_parent = our_hash_hex.clone();
                 if let Ok(mut ui) = ui_state.lock() {
@@ -703,16 +968,19 @@ fn main() {
                     Ok(new_state) => {
                         // 5b. Verify if we won the round
                         if new_state.parent_hash == our_hash_hex {
-                            println!(
+                            events::publish_event(&format!(
                                 "[Net] Server accepted our hash! New parent is: {}",
                                 new_state.parent_hash
-                            );
+                            ));
                         } else {
-                            println!(
+                            events::publish_event(&format!(
                                 "[Net] !!! Server did NOT accept our hash (someone was faster). !!!"
-                            );
-                            println!("    Our hash:   {}", our_hash_hex);
-                            println!("    New parent: {}", new_state.parent_hash);
+                            ));
+                            events::publish_event(&format!("    Our hash:   {}", our_hash_hex));
+                            events::publish_event(&format!(
+                                "    New parent: {}",
+                                new_state.parent_hash
+                            ));
                         }
                         // Update state for the next round
                         if new_state.parent_hash == our_hash_hex {
@@ -735,8 +1003,14 @@ fn main() {
                         // On error, just try to get the latest parent and continue
                         match client.get_latest_parent() {
                             Ok(state) => {
-                                println!("[Net] Difficulty: {}", state.difficulty);
-                                println!("[Net] New parent hash: {}", state.parent_hash);
+                                events::publish_event(&format!(
+                                    "[Net] Difficulty: {}",
+                                    state.difficulty
+                                ));
+                                events::publish_event(&format!(
+                                    "[Net] New parent hash: {}",
+                                    state.parent_hash
+                                ));
                                 current_parent = state.parent_hash.clone();
                                 if let Ok(mut ui) = ui_state.lock() {
                                     ui.parent = current_parent.clone();
@@ -744,7 +1018,10 @@ fn main() {
                                 current_difficulty = state.difficulty;
                             }
                             Err(e) => {
-                                eprintln!("Fatal Error: Could not re-sync with server: {}", e);
+                                events::publish_event(&format!(
+                                    "Fatal Error: Could not re-sync with server: {}",
+                                    e
+                                ));
                                 thread::sleep(Duration::from_secs(10)); // Wait before retrying
                             }
                         }
@@ -753,7 +1030,9 @@ fn main() {
             }
         } else {
             // --- We were interrupted by the checker ---
-            println!("[Main] Miner interrupted (stale parent). Fetching new parent...");
+            events::publish_event(
+                "[Main] Miner interrupted (stale parent). Fetching new parent...",
+            );
             match client.get_latest_parent() {
                 Ok(state) => {
                     events::publish_event(&format!("[Net] Difficulty: {}", state.difficulty));
