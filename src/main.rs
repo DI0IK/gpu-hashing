@@ -21,7 +21,7 @@ use crossterm::terminal::{
 use tui::backend::CrosstermBackend;
 use tui::layout::{Constraint, Direction, Layout};
 use tui::text::{Span, Spans};
-use tui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use tui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use tui::Terminal;
 
 mod events;
@@ -504,8 +504,8 @@ fn spawn_tui(
         // clear current terminal
         terminal.clear().unwrap();
 
-        // Render loop
-        while !APP_EXIT.load(Ordering::Relaxed) {
+    // Render loop
+    'tui_loop: while !APP_EXIT.load(Ordering::Relaxed) {
             // draw
             let ui_clone = ui_state.clone();
             let draw_result = terminal.draw(|f| {
@@ -621,6 +621,7 @@ fn spawn_tui(
 
                         use tui::layout::Rect;
                         let rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+                        f.render_widget(Clear, rect);
                         f.render_widget(popup, rect);
                     }
 
@@ -650,6 +651,7 @@ fn spawn_tui(
 
                         use tui::layout::Rect;
                         let rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+                        f.render_widget(Clear, rect);
                         f.render_widget(popup, rect);
                     }
 
@@ -669,6 +671,7 @@ fn spawn_tui(
                                 .title("Type Parent (Enter=OK, Esc=Cancel)"),
                         );
                         let rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+                        f.render_widget(Clear, rect);
                         f.render_widget(input, rect);
                     }
                 }
@@ -838,14 +841,21 @@ fn spawn_tui(
                             match key.code {
                                 KeyCode::Char('q') | KeyCode::Char('Q') => {
                                     APP_EXIT.store(true, Ordering::SeqCst);
-                                    // exit entire process immediately to avoid blocked threads
-                                    std::process::exit(0);
+                                    // Signal current miner (if any) to stop via shared holder
+                                    if let Ok(shared) = shared_stop_signal.lock() {
+                                        shared.store(true, Ordering::SeqCst);
+                                    }
+                                    // break the tui loop so we can clean up the terminal
+                                    break 'tui_loop;
                                 }
                                 KeyCode::Char('c')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
                                     APP_EXIT.store(true, Ordering::SeqCst);
-                                    std::process::exit(0);
+                                    if let Ok(shared) = shared_stop_signal.lock() {
+                                        shared.store(true, Ordering::SeqCst);
+                                    }
+                                    break 'tui_loop;
                                 }
                                 KeyCode::Char('d') => {
                                     if let Ok(mut ui) = ui_clone.lock() {
