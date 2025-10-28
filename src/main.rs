@@ -63,12 +63,27 @@ struct UIState {
     hash_rate: f64,
     username: String,
     parent: String,
+    // When true, the client will not change `parent` in response to
+    // server updates. Also causes the client to auto-select its own
+    // found solution hash as the next parent.
+    lock_parent: bool,
+    // If the user selected a parent via the UI popup this holds it
+    // until the main loop consumes it and applies it to `current_parent`.
+    selected_parent: Option<String>,
     // Which device is being used (e.g. "CPU" or "GPU: GeForce ...")
     device: String,
     // When true, show the device selection menu overlay
     show_device_menu: bool,
     // Index of currently highlighted item in the device menu
     device_menu_index: usize,
+    // Parent selection popup
+    show_parent_menu: bool,
+    parent_menu_index: usize,
+    // History of seen parents (server- or user-selected). Shown in popup.
+    parent_history: Vec<String>,
+    // When true, show a small text input allowing arbitrary parent entry
+    show_parent_input: bool,
+    parent_input_buffer: String,
     // Available device choices displayed in the menu
     available_devices: Vec<String>,
     // Last rendered device card rectangle (x, y, width, height) for mouse clicks
@@ -102,10 +117,17 @@ impl UIState {
             recent_events: VecDeque::with_capacity(32),
             hash_rate: 0.0,
             username,
-            parent,
+            parent: parent.clone(),
+            lock_parent: false,
+            selected_parent: None,
             device,
             show_device_menu: false,
             device_menu_index: 0,
+            show_parent_menu: false,
+            parent_menu_index: 0,
+            parent_history: vec![parent],
+            show_parent_input: false,
+            parent_input_buffer: String::new(),
             available_devices: Vec::new(),
             device_rect: None,
             total_blocks_mined,
@@ -234,6 +256,36 @@ impl HashClient {
     /// Gets the latest parent hash from the default server URL.
     fn get_latest_parent(&self) -> Result<ServerState, String> {
         self.get_server_state(SERVER_URL)
+    }
+
+    /// Fetch the full list of parents from the server `/raw` endpoint.
+    /// Returns a Vec of (hash, level) in the order returned by server.
+    fn get_parent_list(&self) -> Result<Vec<(String, i32)>, String> {
+        // Reuse logic similar to get_server_state but return full list
+        let mut res = self
+            .http_client
+            .get(SERVER_URL)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        let mut body = String::new();
+        res.read_to_string(&mut body).map_err(|e| e.to_string())?;
+
+        let mut lines = body.lines();
+        // First line is difficulty; ignore it here
+        let _ = lines.next();
+
+        let mut out: Vec<(String, i32)> = Vec::new();
+        for line in lines {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 2 {
+                if let Ok(level) = parts[1].trim().parse::<i32>() {
+                    out.push((parts[0].trim().to_string(), level));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Submits a found seed to the server.
@@ -386,17 +438,36 @@ fn spawn_checker_thread(
                 Ok(state) => {
                     // 4. Compare parent hash
                     if state.parent_hash != current_parent {
-                        // Push a stale-parent event into UI state
+                        // If the UI has locked the parent, do not change it.
                         if let Ok(mut ui) = ui_state.lock() {
                             ui.push_event(format!(
-                                "Stale parent: server {} != local {}",
+                                "Server parent changed: server {} != local {}",
                                 state.parent_hash, current_parent
                             ));
-                            // Show new parent in UI (server value)
-                            ui.parent = state.parent_hash.clone();
+
+                            // Add server parent to history for user's reference
+                            if !ui.parent_history.iter().any(|p| p == &state.parent_hash) {
+                                ui.parent_history.insert(0, state.parent_hash.clone());
+                                if ui.parent_history.len() > 64 {
+                                    ui.parent_history.pop();
+                                }
+                            }
+
+                            if ui.lock_parent {
+                                // We ignore the server change while locked
+                                ui.push_event(
+                                    "Parent locked: ignoring server parent change.".to_string(),
+                                );
+                                // Do NOT update ui.parent nor signal the miner to stop
+                                // Continue watching
+                                continue;
+                            } else {
+                                // Update UI to show server parent and signal the miner to stop
+                                ui.parent = state.parent_hash.clone();
+                            }
                         }
 
-                        // 5. Signal the miner to stop
+                        // 5. Signal the miner to stop so main restarts with new parent
                         if stop_signal
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
                             .is_ok()
@@ -420,6 +491,7 @@ fn spawn_checker_thread(
 fn spawn_tui(
     ui_state: Arc<Mutex<UIState>>,
     shared_stop_signal: Arc<Mutex<Arc<AtomicBool>>>,
+    client: HashClient,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Terminal setup
@@ -438,15 +510,20 @@ fn spawn_tui(
             let ui_clone = ui_state.clone();
             let draw_result = terminal.draw(|f| {
                 let size = f.size();
+                use tui::layout::Rect;
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .margin(1)
-                    .constraints([Constraint::Length(3), Constraint::Min(3)])
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(3),
+                        Constraint::Length(3),
+                    ])
                     .split(size);
 
                 // Header: username and parent and rate
                 // Lock UIState (mutable) so we can also record the device card rectangle
-                let (username, parent, rate, device, events, blocks) =
+                let (username, parent, rate, device, events, blocks, lock_parent) =
                     if let Ok(ui) = ui_clone.lock() {
                         (
                             ui.username.clone(),
@@ -455,6 +532,7 @@ fn spawn_tui(
                             ui.device.clone(),
                             ui.recent_events.clone(),
                             ui.total_blocks_mined,
+                            ui.lock_parent,
                         )
                     } else {
                         (
@@ -464,6 +542,7 @@ fn spawn_tui(
                             "-".to_string(),
                             VecDeque::new(),
                             0u64,
+                            false,
                         )
                     };
 
@@ -483,9 +562,14 @@ fn spawn_tui(
                         .block(Block::default().borders(Borders::ALL).title("User"));
                 f.render_widget(user_card, top_chunks[0]);
 
+                let parent_title = if lock_parent {
+                    "Parent (locked)"
+                } else {
+                    "Parent"
+                };
                 let parent_card =
                     Paragraph::new(Spans::from(vec![Span::raw(format!("{}", parent))]))
-                        .block(Block::default().borders(Borders::ALL).title("Parent"));
+                        .block(Block::default().borders(Borders::ALL).title(parent_title));
                 f.render_widget(parent_card, top_chunks[1]);
 
                 let rate_card = Paragraph::new(Spans::from(vec![Span::raw(format!(
@@ -539,6 +623,54 @@ fn spawn_tui(
                         let rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
                         f.render_widget(popup, rect);
                     }
+
+                    // Parent selection popup
+                    if ui.show_parent_menu {
+                        let popup_width = 80u16.min(size.width.saturating_sub(4));
+                        // Show up to 10 entries
+                        let show_count = ui.parent_history.len().min(10);
+                        let popup_height = (show_count as u16).saturating_add(2).max(3);
+                        let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+                        let popup_y = (size.height.saturating_sub(popup_height)) / 2;
+
+                        let mut lines: Vec<Spans> = Vec::new();
+                        for (i, p) in ui.parent_history.iter().enumerate().take(10) {
+                            if i == ui.parent_menu_index {
+                                lines.push(Spans::from(vec![Span::raw(format!("> {}", p))]));
+                            } else {
+                                lines.push(Spans::from(vec![Span::raw(format!("  {}", p))]));
+                            }
+                        }
+
+                        let popup = Paragraph::new(lines).block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Select Parent (press 'l' to toggle lock)"),
+                        );
+
+                        use tui::layout::Rect;
+                        let rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+                        f.render_widget(popup, rect);
+                    }
+
+                    // Parent input box (typing an arbitrary hash)
+                    if ui.show_parent_input {
+                        let popup_width = 80u16.min(size.width.saturating_sub(4));
+                        let popup_height = 3u16;
+                        let popup_x = (size.width.saturating_sub(popup_width)) / 2;
+                        let popup_y = (size.height.saturating_sub(popup_height)) / 2;
+                        let input = Paragraph::new(Spans::from(vec![Span::raw(format!(
+                            "Type parent: {}",
+                            ui.parent_input_buffer
+                        ))]))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Type Parent (Enter=OK, Esc=Cancel)"),
+                        );
+                        let rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+                        f.render_widget(input, rect);
+                    }
                 }
 
                 // Events list
@@ -549,6 +681,16 @@ fn spawn_tui(
                 let list =
                     List::new(items).block(Block::default().borders(Borders::ALL).title("Recent"));
                 f.render_widget(list, chunks[1]);
+
+                // Footer: keybinds and lock state
+                let lock_text = if lock_parent { "LOCKED" } else { "unlocked" };
+                let footer_text = format!(
+                    "Keys: p=Select Parent  l=Toggle Lock({})  d=Device Menu  q=Quit",
+                    lock_text
+                );
+                let footer = Paragraph::new(Spans::from(vec![Span::raw(footer_text)]))
+                    .block(Block::default().borders(Borders::ALL).title("Keys"));
+                f.render_widget(footer, chunks[2]);
             });
 
             if draw_result.is_err() {
@@ -560,7 +702,7 @@ fn spawn_tui(
                 if let Ok(ev) = crossterm::event::read() {
                     match ev {
                         CEvent::Key(key) => {
-                            // If the device menu is open, handle navigation and selection
+                            // If the device or parent menu is open, handle navigation and selection
                             if let Ok(mut ui) = ui_clone.lock() {
                                 if ui.show_device_menu {
                                     match key.code {
@@ -603,6 +745,93 @@ fn spawn_tui(
                                     }
                                     continue; // menu handled
                                 }
+
+                                // Parent menu navigation and input
+                                if ui.show_parent_menu {
+                                    // If we're in input mode, capture typed characters
+                                    if ui.show_parent_input {
+                                        match key.code {
+                                            KeyCode::Char(c) => {
+                                                // Append printable characters up to a limit
+                                                if !c.is_control()
+                                                    && ui.parent_input_buffer.len() < 128
+                                                {
+                                                    ui.parent_input_buffer.push(c);
+                                                }
+                                            }
+                                            KeyCode::Backspace => {
+                                                ui.parent_input_buffer.pop();
+                                            }
+                                            KeyCode::Enter => {
+                                                if !ui.parent_input_buffer.is_empty() {
+                                                    let choice = ui.parent_input_buffer.clone();
+                                                    ui.selected_parent = Some(choice.clone());
+                                                    ui.parent = choice.clone();
+                                                    ui.show_parent_input = false;
+                                                    ui.show_parent_menu = false;
+                                                    events::publish_event(&format!(
+                                                        "Parent typed and selected: {}",
+                                                        choice
+                                                    ));
+                                                    if let Ok(shared) = shared_stop_signal.lock() {
+                                                        shared.store(true, Ordering::SeqCst);
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Esc => {
+                                                ui.show_parent_input = false;
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+
+                                    match key.code {
+                                        KeyCode::Down => {
+                                            if !ui.parent_history.is_empty() {
+                                                ui.parent_menu_index = (ui.parent_menu_index + 1)
+                                                    % ui.parent_history.len();
+                                            }
+                                        }
+                                        KeyCode::Up => {
+                                            if !ui.parent_history.is_empty() {
+                                                if ui.parent_menu_index == 0 {
+                                                    ui.parent_menu_index =
+                                                        ui.parent_history.len() - 1;
+                                                } else {
+                                                    ui.parent_menu_index -= 1;
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('i') => {
+                                            // Enter input mode to type arbitrary parent
+                                            ui.show_parent_input = true;
+                                            ui.parent_input_buffer.clear();
+                                        }
+                                        KeyCode::Enter => {
+                                            if !ui.parent_history.is_empty() {
+                                                let choice =
+                                                    ui.parent_history[ui.parent_menu_index].clone();
+                                                ui.selected_parent = Some(choice.clone());
+                                                ui.parent = choice.clone();
+                                                ui.show_parent_menu = false;
+                                                events::publish_event(&format!(
+                                                    "Parent selected by user: {}",
+                                                    choice
+                                                ));
+                                                // Signal miner to stop so main can restart with new parent
+                                                if let Ok(shared) = shared_stop_signal.lock() {
+                                                    shared.store(true, Ordering::SeqCst);
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Esc => {
+                                            ui.show_parent_menu = false;
+                                        }
+                                        _ => {}
+                                    }
+                                    continue;
+                                }
                             }
 
                             // Global key bindings
@@ -626,6 +855,54 @@ fn spawn_tui(
                                             .iter()
                                             .position(|d| *d == ui.device)
                                             .unwrap_or(0);
+                                    }
+                                }
+                                // Open parent selection popup (fetch full list from server)
+                                KeyCode::Char('p') => {
+                                    // Fetch in this thread (blocking) then populate UI
+                                    match client.get_parent_list() {
+                                        Ok(mut list) => {
+                                            // sort by level desc (newest/highest first)
+                                            list.sort_by(|a, b| b.1.cmp(&a.1));
+                                            let hashes: Vec<String> =
+                                                list.into_iter().map(|(h, _)| h).collect();
+                                            if let Ok(mut ui) = ui_clone.lock() {
+                                                if !hashes.is_empty() {
+                                                    ui.parent_history = hashes;
+                                                }
+                                                ui.parent_menu_index = ui
+                                                    .parent_history
+                                                    .iter()
+                                                    .position(|p| *p == ui.parent)
+                                                    .unwrap_or(0);
+                                                ui.show_parent_menu = true;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            events::publish_event(&format!(
+                                                "Failed to fetch parent list: {}",
+                                                e
+                                            ));
+                                            // Fallback: open existing history
+                                            if let Ok(mut ui) = ui_clone.lock() {
+                                                ui.parent_menu_index = ui
+                                                    .parent_history
+                                                    .iter()
+                                                    .position(|p| *p == ui.parent)
+                                                    .unwrap_or(0);
+                                                ui.show_parent_menu = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Toggle parent lock
+                                KeyCode::Char('l') => {
+                                    if let Ok(mut ui) = ui_clone.lock() {
+                                        ui.lock_parent = !ui.lock_parent;
+                                        events::publish_event(&format!(
+                                            "Parent lock: {}",
+                                            if ui.lock_parent { "ON" } else { "OFF" }
+                                        ));
                                     }
                                 }
                                 _ => {}
@@ -801,8 +1078,8 @@ fn main() {
     let shared_stop_signal: Arc<Mutex<Arc<AtomicBool>>> =
         Arc::new(Mutex::new(Arc::new(AtomicBool::new(false))));
 
-    // Spawn TUI (give it access to the shared stop-signal)
-    let _tui_handle = spawn_tui(ui_state.clone(), shared_stop_signal.clone());
+    // Spawn TUI (give it access to the shared stop-signal and the client)
+    let _tui_handle = spawn_tui(ui_state.clone(), shared_stop_signal.clone(), client.clone());
 
     // Spawn hash rate logging thread -> update UI state instead of printing
     {
@@ -836,6 +1113,15 @@ fn main() {
         // to request the miner be interrupted (e.g. when the user changes device).
         if let Ok(mut holder) = shared_stop_signal.lock() {
             *holder = stop_signal.clone();
+        }
+
+        // If the user selected a parent from the UI, apply it for this round
+        if let Ok(mut ui) = ui_state.lock() {
+            if let Some(sel) = ui.selected_parent.take() {
+                events::publish_event(&format!("Applying user-selected parent: {}", sel));
+                current_parent = sel.clone();
+                ui.parent = sel;
+            }
         }
 
         // 2. Spawn the checker thread
@@ -982,6 +1268,23 @@ fn main() {
                                 new_state.parent_hash
                             ));
                         }
+                        // If the UI has locked the parent, auto-select our found hash
+                        // and DO NOT overwrite it with the server's parent later.
+                        let mut consumed_lock = false;
+                        if let Ok(mut ui) = ui_state.lock() {
+                            if ui.lock_parent {
+                                events::publish_event(&format!(
+                                    "Parent lock active: using our found hash as next parent: {}",
+                                    our_hash_hex
+                                ));
+                                // Apply locally; main will not overwrite when lock is active
+                                current_parent = our_hash_hex.clone();
+                                ui.parent = our_hash_hex.clone();
+                                ui.push_event(format!("Locked: chosen parent {}", our_hash_hex));
+                                ui.increment_blocks();
+                                consumed_lock = true;
+                            }
+                        }
                         // Update state for the next round
                         if new_state.parent_hash == our_hash_hex {
                             if let Ok(mut ui) = ui_state.lock() {
@@ -989,9 +1292,11 @@ fn main() {
                                 ui.increment_blocks();
                             }
                         }
-                        current_parent = new_state.parent_hash.clone();
-                        if let Ok(mut ui) = ui_state.lock() {
-                            ui.parent = new_state.parent_hash.clone();
+                        if !consumed_lock {
+                            current_parent = new_state.parent_hash.clone();
+                            if let Ok(mut ui) = ui_state.lock() {
+                                ui.parent = new_state.parent_hash.clone();
+                            }
                         }
                         current_difficulty = new_state.difficulty;
                     }
