@@ -117,10 +117,30 @@ impl GpuMiner {
         let context = Context::builder().devices(device).build()?;
         let queue = Queue::new(&context, device, None)?;
 
-        let program = ProgramBuilder::new()
+        let program = match ProgramBuilder::new()
             .devices(device)
             .src(OPENCL_KERNEL_SRC)
-            .build(&context)?;
+            .build(&context)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                // Log the error and a short snippet of the kernel source
+                let src_preview: String = OPENCL_KERNEL_SRC
+                    .lines()
+                    .take(60)
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                crate::events::publish_event(&format!("[GPU] OpenCL program build FAILED: {}", e));
+                crate::events::publish_event("[GPU] Kernel source (first 60 lines):");
+                for line in src_preview.lines() {
+                    crate::events::publish_event(&format!("[GPU]   {}", line));
+                }
+                crate::events::publish_event(
+                    "[GPU] Check your OpenCL drivers and kernel for syntax errors.",
+                );
+                return Err(e);
+            }
+        };
 
         // --- Kernel 1: The new midstate calculator ---
         // (This code is now valid since Sha256Ctx implements OclPrm)
@@ -178,13 +198,22 @@ impl GpuMiner {
             .copy_host_slice(base_line.as_bytes())
             .build()?;
 
-        // --- ADDED: Buffer to hold the single midstate struct ---
-        // (This code is now valid since Sha256Ctx implements OclPrm)
-        let midstate_buf: Buffer<Sha256Ctx> = Buffer::builder()
+        // --- MODIFICATION: Create TWO midstate buffers ---
+        // 1. A Read/Write buffer for the `midstate_kernel` to write into.
+        let midstate_buf_rw: Buffer<Sha256Ctx> = Buffer::builder()
             .context(&self.context)
-            .flags(MemFlags::READ_WRITE) // Written by kernel 1, read by kernel 2
+            .flags(MemFlags::READ_WRITE) // Written by kernel 1
             .len(1)
-            .build()?; // We don't need to init with data, so .build() is fine
+            .build()?;
+
+        // 2. A Read-Only buffer for the `find_hash_kernel` to read from.
+        //    This is required to use `__constant` memory.
+        let midstate_buf_const: Buffer<Sha256Ctx> = Buffer::builder()
+            .context(&self.context)
+            .flags(MemFlags::READ_ONLY) // Read by kernel 2
+            .len(1)
+            .build()?;
+        // --- End Modification ---
 
         let result_local_id_buf: Buffer<u32> = Buffer::builder()
             .context(&self.context)
@@ -201,10 +230,10 @@ impl GpuMiner {
 
         // --- ADDED: Run Midstate Kernel *ONCE* ---
         crate::events::publish_event("[GPU] Calculating midstate for new job...");
-        // (This code is now valid since Sha256Ctx implements OclPrm)
         self.midstate_kernel.set_arg(0, &base_line_buf)?;
         self.midstate_kernel.set_arg(1, base_len as i32)?;
-        self.midstate_kernel.set_arg(2, &midstate_buf)?;
+        // --- MODIFICATION: Write to the _rw buffer ---
+        self.midstate_kernel.set_arg(2, &midstate_buf_rw)?;
 
         unsafe {
             self.midstate_kernel
@@ -213,7 +242,12 @@ impl GpuMiner {
                 .global_work_size(1) // Run ONCE on ONE thread
                 .enq()?;
         }
-        // --- Midstate is now calculated and lives in `midstate_buf` ---
+
+        midstate_buf_rw
+            .cmd()
+            .copy(&midstate_buf_const, None, None)
+            .queue(&self.queue)
+            .enq()?;
 
         crate::events::publish_event(&format!(
             "[GPU] Starting hash search with batch size {GLOBAL_WORK_SIZE}..."
@@ -234,8 +268,7 @@ impl GpuMiner {
                 .enq()?;
 
             // --- Set kernel arguments (MODIFIED) ---
-            // (This code is now valid since Sha256Ctx implements OclPrm)
-            self.find_hash_kernel.set_arg(0, &midstate_buf)?; // Pass midstate
+            self.find_hash_kernel.set_arg(0, &midstate_buf_const)?;
             self.find_hash_kernel.set_arg(1, start_nonce)?;
             self.find_hash_kernel.set_arg(2, difficulty as u32)?;
             self.find_hash_kernel.set_arg(3, &result_local_id_buf)?;
@@ -269,6 +302,7 @@ impl GpuMiner {
                 {
                     // We were first! Read the hash and return.
                     let found_nonce = start_nonce + (result_local_id[0] as u64);
+
                     let seed_str = format!("{:x}", found_nonce);
 
                     let mut hash_bytes = [0u8; 32];

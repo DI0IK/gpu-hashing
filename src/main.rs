@@ -1016,6 +1016,7 @@ fn main() {
                     "[GPU] FATAL: Failed to initialize GPU miner: {}",
                     e
                 ));
+                println!("[GPU] FATAL: Failed to initialize GPU miner: {}", e);
                 events::publish_event("[GPU] Check your OpenCL drivers. Falling back to CPU.");
                 None
             }

@@ -1,12 +1,24 @@
 /*
- * OpenCL SHA-256 Kernel (Optimized for Midstate)
+ * OpenCL SHA-256 Kernel (Optimized for Midstate & Hex-String Nonce)
  *
- * This kernel is split into a pre-calculator for the constant
- * 'base_line' and a main kernel for checking nonces.
+ * (Version 2: Reverted bswap32 to manual byte-swap for portability)
+ *
+ * This kernel is for protocols that require the nonce to be
+ * appended as its hex-string representation, not raw bytes.
+ *
+ * Key Optimizations Applied:
+ * 1. find_hash_kernel:
+ * - Midstate loaded from `__constant` memory.
+ * - Nonce (u64) is converted to a 16-char hex string
+ * using a fast, branchless, unrolled function.
+ * 2. sha256_final_and_check:
+ * - Uses `clz()` (Count Leading Zeros) intrinsic for difficulty check.
+ * 3. sha256_transform:
+ * - State registers (a-h) vectorized into a `uint8`.
+ * - Message loading uses portable, manual byte-swapping.
  */
 
 // --- SHA-256 Constants and Macros ---
-// (Same as before)
 #define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 #define SHR(x, n) ((x) >> (n))
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
@@ -28,7 +40,6 @@ constant uint K[64] = {
 };
 
 // --- SHA-256 Context Struct ---
-// (Must match the Rust struct)
 typedef struct {
     uint H[8];
     uchar M[64];
@@ -41,8 +52,8 @@ typedef struct {
 // Single SHA-256 transform
 inline void sha256_transform(sha256_ctx *ctx) {
     uint W[64];
-    uint a, b, c, d, e, f, g, h;
     
+    // --- FIX: Reverted from bswap32 to manual, portable byte-swapping ---
     #pragma unroll
     for (int i = 0, j = 0; i < 16; i++, j += 4) {
         W[i] = (ctx->M[j] << 24) | (ctx->M[j + 1] << 16) | (ctx->M[j + 2] << 8) | ctx->M[j + 3];
@@ -53,19 +64,24 @@ inline void sha256_transform(sha256_ctx *ctx) {
         W[i] = SIG1(W[i - 2]) + W[i - 7] + SIG0(W[i - 15]) + W[i - 16];
     }
 
-    a = ctx->H[0]; b = ctx->H[1]; c = ctx->H[2]; d = ctx->H[3];
-    e = ctx->H[4]; f = ctx->H[5]; g = ctx->H[6]; h = ctx->H[7];
+    uint8 H_vec = (uint8)(ctx->H[0], ctx->H[1], ctx->H[2], ctx->H[3],
+                         ctx->H[4], ctx->H[5], ctx->H[6], ctx->H[7]);
 
     #pragma unroll
     for (int i = 0; i < 64; i++) {
-        uint T1 = h + EP1(e) + CH(e, f, g) + K[i] + W[i];
-        uint T2 = EP0(a) + MAJ(a, b, c);
-        h = g; g = f; f = e; e = d + T1;
-        d = c; c = b; b = a; a = T1 + T2;
+        uint T1 = H_vec.s7 + EP1(H_vec.s4) + CH(H_vec.s4, H_vec.s5, H_vec.s6) + K[i] + W[i];
+        uint T2 = EP0(H_vec.s0) + MAJ(H_vec.s0, H_vec.s1, H_vec.s2);
+        
+        H_vec = (uint8)(T1 + T2, H_vec.s0, H_vec.s1, H_vec.s2,
+                       H_vec.s3 + T1, H_vec.s4, H_vec.s5, H_vec.s6);
     }
 
-    ctx->H[0] += a; ctx->H[1] += b; ctx->H[2] += c; ctx->H[3] += d;
-    ctx->H[4] += e; ctx->H[5] += f; ctx->H[6] += g; ctx->H[7] += h;
+    uint8 H_in = (uint8)(ctx->H[0], ctx->H[1], ctx->H[2], ctx->H[3],
+                        ctx->H[4], ctx->H[5], ctx->H[6], ctx->H[7]);
+    H_vec += H_in;
+
+    ctx->H[0] = H_vec.s0; ctx->H[1] = H_vec.s1; ctx->H[2] = H_vec.s2; ctx->H[3] = H_vec.s3;
+    ctx->H[4] = H_vec.s4; ctx->H[5] = H_vec.s5; ctx->H[6] = H_vec.s6; ctx->H[7] = H_vec.s7;
 }
 
 // Initialize a new context
@@ -116,7 +132,6 @@ inline void sha256_update_local(sha256_ctx *ctx, const uchar* data, int len) {
 }
 
 // Finalize hash: Apply padding and run last transform(s)
-// --- MODIFIED: Returns 'bool' (pass/fail) ---
 inline bool sha256_final_and_check(sha256_ctx *ctx, uint difficulty) {
     // Padding
     int n_mod_64 = (int)(ctx->N % 64);
@@ -146,37 +161,17 @@ inline bool sha256_final_and_check(sha256_ctx *ctx, uint difficulty) {
 
     sha256_transform(ctx);
     
-    // --- OPTIMIZATION: Early Exit & Difficulty Check ---
-    // Check H registers directly, avoid creating hash_output array
-    
-    int bits = 0;
+    // --- OPTIMIZATION: Early Exit & Difficulty Check using clz() ---
+    uint bits = 0;
     for (int i = 0; i < 8; i++) {
         uint h_val = ctx->H[i];
-        
-        // Check 4 bytes of this H register
-        uchar b;
-        
-        b = (uchar)(h_val >> 24); // Byte 0
-        if (b == 0) { bits += 8; } 
-        else { while ((b & 0x80) == 0) { bits++; b <<= 1; } break; }
-        if (bits >= difficulty) return true;
-
-        b = (uchar)(h_val >> 16); // Byte 1
-        if (b == 0) { bits += 8; } 
-        else { while ((b & 0x80) == 0) { bits++; b <<= 1; } break; }
-        if (bits >= difficulty) return true;
-
-        b = (uchar)(h_val >> 8); // Byte 2
-        if (b == 0) { bits += 8; } 
-        else { while ((b & 0x80) == 0) { bits++; b <<= 1; } break; }
-        if (bits >= difficulty) return true;
-
-        b = (uchar)(h_val); // Byte 3
-        if (b == 0) { bits += 8; } 
-        else { while ((b & 0x80) == 0) { bits++; b <<= 1; } break; }
+        uint leading_zeros = clz(h_val); 
+        bits += leading_zeros;
+        if (leading_zeros < 32) {
+            return (bits >= difficulty);
+        }
         if (bits >= difficulty) return true;
     }
-    
     return (bits >= difficulty);
 }
 
@@ -190,34 +185,8 @@ inline void write_hash_from_H(__global uchar* hash_out, sha256_ctx *ctx) {
     }
 }
 
-// --- Helper: ulong to hex string (Same as before) ---
-inline int ulong_to_hex(ulong n, char* out) {
-    const char hex_chars[] = "0123456789abcdef";
-    char buf[16];
-    int i = 0;
-
-    if (n == 0) {
-        out[0] = '0';
-        return 1;
-    }
-
-    while (n > 0) {
-        buf[i++] = hex_chars[n & 0xF];
-        n >>= 4;
-    }
-
-    for (int j = 0; j < i; j++) {
-        out[j] = buf[i - 1 - j];
-    }
-    return i;
-}
-
-
 /*
  * == KERNEL 1: Calculate Midstate (Run ONCE) ==
- *
- * Takes the constant base_line, hashes it, and saves the
- * resulting SHA-256 context (H, M, N) as the "midstate".
  */
 __kernel void calculate_midstate_kernel(
     __global const uchar* base_line,
@@ -227,20 +196,41 @@ __kernel void calculate_midstate_kernel(
     sha256_ctx ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, base_line, base_len);
-    
-    // Write the entire context struct to global memory
     *midstate_out = ctx;
+}
+
+
+// --- ADDED: Fast, branchless u64-to-hex converter ---
+inline void ulong_to_hex_fixed16(ulong n, char* out) {
+    const char hex_chars[] = "0123456789abcdef";
+    
+    // Unroll the loop manually for 16 characters (64 bits)
+    out[0]  = hex_chars[(n >> 60) & 0xF];
+    out[1]  = hex_chars[(n >> 56) & 0xF];
+    out[2]  = hex_chars[(n >> 52) & 0xF];
+    out[3]  = hex_chars[(n >> 48) & 0xF];
+    out[4]  = hex_chars[(n >> 44) & 0xF];
+    out[5]  = hex_chars[(n >> 40) & 0xF];
+    out[6]  = hex_chars[(n >> 36) & 0xF];
+    out[7]  = hex_chars[(n >> 32) & 0xF];
+    out[8]  = hex_chars[(n >> 28) & 0xF];
+    out[9]  = hex_chars[(n >> 24) & 0xF];
+    out[10] = hex_chars[(n >> 20) & 0xF];
+    out[11] = hex_chars[(n >> 16) & 0xF];
+    out[12] = hex_chars[(n >> 12) & 0xF];
+    out[13] = hex_chars[(n >> 8)  & 0xF];
+    out[14] = hex_chars[(n >> 4)  & 0xF];
+    out[15] = hex_chars[n & 0xF];
 }
 
 
 /*
  * == KERNEL 2: Find Hash (Run 10M+ times) ==
  *
- * Starts from the pre-calculated midstate, adds the
- * unique nonce, and checks for a valid hash.
+ * (CORRECTED to use hex-string nonce)
  */
 __kernel void find_hash_kernel(
-    __global const sha256_ctx* midstate, // <-- INPUT
+    __constant const sha256_ctx* midstate, // <-- OPTIMIZATION: Use __constant
     ulong start_nonce,
     uint difficulty,
     __global uint* result_local_id,
@@ -249,25 +239,23 @@ __kernel void find_hash_kernel(
     ulong global_id = get_global_id(0);
     ulong nonce = start_nonce + global_id;
 
-    // --- Optimization: Check if already found ---
     if (*result_local_id != (uint)(-1)) {
         return;
     }
 
-    // 1. Load the pre-calculated midstate
-    sha256_ctx ctx = *midstate; // Fast struct copy
+    // 1. Load the pre-calculated midstate (fast read from constant cache)
+    sha256_ctx ctx = *midstate;
 
-    // 2. Construct nonce hex
-    char nonce_hex[17];
-    int nonce_len = ulong_to_hex(nonce, nonce_hex);
+    // 2. --- MODIFICATION: Convert u64 nonce to 16-char hex string ---
+    char nonce_hex[16];
+    ulong_to_hex_fixed16(nonce, nonce_hex);
     
-    // 3. Update context with nonce_hex
-    sha256_update_local(&ctx, (const uchar*)nonce_hex, nonce_len);
+    // 3. Update context with the 16-char hex string
+    sha256_update_local(&ctx, (const uchar*)nonce_hex, 16);
 
-    // 4. Finalize hash and check difficulty
+    // 4. Finalize hash and check difficulty (now much faster)
     if (sha256_final_and_check(&ctx, difficulty)) {
         // We found a winner!
-        // Atomically write our global_id (if no one else has)
         if (atomic_cmpxchg(result_local_id, (uint)(-1), (uint)global_id) == (uint)(-1)) {
             // We were first! Write our hash to the output buffer.
             write_hash_from_H(result_hash, &ctx);
