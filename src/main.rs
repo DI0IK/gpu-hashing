@@ -504,8 +504,8 @@ fn spawn_tui(
         // clear current terminal
         terminal.clear().unwrap();
 
-    // Render loop
-    'tui_loop: while !APP_EXIT.load(Ordering::Relaxed) {
+        // Render loop
+        'tui_loop: while !APP_EXIT.load(Ordering::Relaxed) {
             // draw
             let ui_clone = ui_state.clone();
             let draw_result = terminal.draw(|f| {
