@@ -1,21 +1,26 @@
 /*
  * OpenCL SHA-256 Kernel (Optimized for Midstate & Hex-String Nonce)
  *
- * (Version 2: Reverted bswap32 to manual byte-swap for portability)
+ * (Version 3: Heavily Optimized for fixed-pattern workload)
  *
- * This kernel is for protocols that require the nonce to be
- * appended as its hex-string representation, not raw bytes.
+ * This kernel is for protocols that hash:
+ * <64_byte_parent> + ' ' + <name_1-16byte> + ' ' + <16byte_hex_nonce>
  *
- * Key Optimizations Applied:
+ * Optimizations Applied:
  * 1. find_hash_kernel:
- * - Midstate loaded from `__constant` memory.
- * - Nonce (u64) is converted to a 16-char hex string
- * using a fast, branchless, unrolled function.
- * 2. sha256_final_and_check:
- * - Uses `clz()` (Count Leading Zeros) intrinsic for difficulty check.
- * 3. sha256_transform:
- * - State registers (a-h) vectorized into a `uint8`.
- * - Message loading uses portable, manual byte-swapping.
+ * - Inlines the ulong_to_hex_fixed16 conversion.
+ * - Calls a new, specialized `sha256_update_local_16_fast`.
+ * - Calls a new, specialized `sha256_final_and_check_fast`.
+ *
+ * 2. sha256_update_local_16_fast:
+ * - Removed all boundary-check logic (which is dead code for this workload).
+ * - Performs a simple, unrolled 16-byte copy.
+ *
+ * 3. sha256_final_and_check_fast:
+ * - Removed the `if (n_mod_64 > 56)` branch (dead code for this workload).
+ * - Replaced the byte-wise zero-padding loop with a fast, word-aligned
+ * (uint-based) "memset".
+ * - Fully unrolled the final clz() difficulty check.
  */
 
 // --- SHA-256 Constants and Macros ---
@@ -47,13 +52,13 @@ typedef struct {
 } sha256_ctx;
 
 
-// --- SHA-256 Core Functions (Refactored) ---
+// --- SHA-256 Core Functions ---
 
-// Single SHA-256 transform
+// Single SHA-256 transform (Unchanged)
 inline void sha256_transform(sha256_ctx *ctx) {
     uint W[64];
     
-    // --- FIX: Reverted from bswap32 to manual, portable byte-swapping ---
+    // Portable manual byte-swapping
     #pragma unroll
     for (int i = 0, j = 0; i < 16; i++, j += 4) {
         W[i] = (ctx->M[j] << 24) | (ctx->M[j + 1] << 16) | (ctx->M[j + 2] << 8) | ctx->M[j + 3];
@@ -73,26 +78,26 @@ inline void sha256_transform(sha256_ctx *ctx) {
         uint T2 = EP0(H_vec.s0) + MAJ(H_vec.s0, H_vec.s1, H_vec.s2);
         
         H_vec = (uint8)(T1 + T2, H_vec.s0, H_vec.s1, H_vec.s2,
-                       H_vec.s3 + T1, H_vec.s4, H_vec.s5, H_vec.s6);
+                        H_vec.s3 + T1, H_vec.s4, H_vec.s5, H_vec.s6);
     }
 
     uint8 H_in = (uint8)(ctx->H[0], ctx->H[1], ctx->H[2], ctx->H[3],
-                        ctx->H[4], ctx->H[5], ctx->H[6], ctx->H[7]);
+                         ctx->H[4], ctx->H[5], ctx->H[6], ctx->H[7]);
     H_vec += H_in;
 
     ctx->H[0] = H_vec.s0; ctx->H[1] = H_vec.s1; ctx->H[2] = H_vec.s2; ctx->H[3] = H_vec.s3;
     ctx->H[4] = H_vec.s4; ctx->H[5] = H_vec.s5; ctx->H[6] = H_vec.s6; ctx->H[7] = H_vec.s7;
 }
 
-// Initialize a new context
+// Initialize a new context (Unchanged)
 inline void sha256_init(sha256_ctx *ctx) {
     ctx->H[0] = 0x6a09e667; ctx->H[1] = 0xbb67ae85; ctx->H[2] = 0x3c6ef372; ctx->H[3] = 0xa54ff53a;
     ctx->H[4] = 0x510e527f; ctx->H[5] = 0x9b05688c; ctx->H[6] = 0x1f83d9ab; ctx->H[7] = 0x5be0cd19;
     ctx->N = 0;
 }
 
-// Update context with data (processes full blocks)
-inline void sha256_update(sha256_ctx *ctx, __global const uchar* data, int len) {
+// Update context with GLOBAL data (for midstate)
+inline void sha256_update_global(sha256_ctx *ctx, __global const uchar* data, int len) {
     int pos = 0;
     while(pos < len) {
         int n_mod_64 = (int)(ctx->N % 64);
@@ -111,44 +116,62 @@ inline void sha256_update(sha256_ctx *ctx, __global const uchar* data, int len) 
     }
 }
 
-// Update context with local char data (for nonce)
-inline void sha256_update_local(sha256_ctx *ctx, const uchar* data, int len) {
-    int pos = 0;
-    while(pos < len) {
-        int n_mod_64 = (int)(ctx->N % 64);
-        int copy_len = min(64 - n_mod_64, len - pos);
-        
-        for(int i=0; i < copy_len; i++) {
-            ctx->M[n_mod_64 + i] = data[pos + i];
-        }
+// --- OPTIMIZATION: Specialized 16-byte update for nonce ---
+// This function assumes it is *only* for the 16-byte hex nonce
+// and that (N % 64) + 16 < 64, which we proved is true.
+inline void sha256_update_local_16_fast(sha256_ctx *ctx, const uchar* data) {
+    int n_mod_64 = (int)(ctx->N % 64);
 
-        ctx->N += copy_len;
-        pos += copy_len;
+    // Unrolled 16-byte copy
+    ctx->M[n_mod_64 + 0]  = data[0];
+    ctx->M[n_mod_64 + 1]  = data[1];
+    ctx->M[n_mod_64 + 2]  = data[2];
+    ctx->M[n_mod_64 + 3]  = data[3];
+    ctx->M[n_mod_64 + 4]  = data[4];
+    ctx->M[n_mod_64 + 5]  = data[5];
+    ctx->M[n_mod_64 + 6]  = data[6];
+    ctx->M[n_mod_64 + 7]  = data[7];
+    ctx->M[n_mod_64 + 8]  = data[8];
+    ctx->M[n_mod_64 + 9]  = data[9];
+    ctx->M[n_mod_64 + 10] = data[10];
+    ctx->M[n_mod_64 + 11] = data[11];
+    ctx->M[n_mod_64 + 12] = data[12];
+    ctx->M[n_mod_64 + 13] = data[13];
+    ctx->M[n_mod_64 + 14] = data[14];
+    ctx->M[n_mod_64 + 15] = data[15];
 
-        if ((ctx->N % 64) == 0) {
-            sha256_transform(ctx);
-        }
-    }
+    ctx->N += 16;
 }
 
-// Finalize hash: Apply padding and run last transform(s)
-inline bool sha256_final_and_check(sha256_ctx *ctx, uint difficulty) {
-    // Padding
+// --- OPTIMIZATION: Specialized finalization ---
+// This function removes the `if (n_mod_64 > 56)` branch (dead code)
+// and uses a word-aligned "fast memset" for zero-padding.
+inline bool sha256_final_and_check_fast(sha256_ctx *ctx, uint difficulty) {
+    // 1. Padding
     int n_mod_64 = (int)(ctx->N % 64);
     ctx->M[n_mod_64++] = 0x80;
     
-    if (n_mod_64 > 56) {
-        for(int i=n_mod_64; i < 64; i++) {
-            ctx->M[i] = 0;
-        }
-        sha256_transform(ctx);
-        n_mod_64 = 0;
+    // NOTE: The `if (n_mod_64 > 56)` block is REMOVED as it's
+    // provably dead code for this specific workload.
+    
+    // 2. OPTIMIZATION: Fast zero-pad using uint
+    
+    // 2a. Handle unaligned start (max 3 bytes)
+    while(n_mod_64 < 56 && (n_mod_64 % 4 != 0)) {
+        ctx->M[n_mod_64++] = 0;
+    }
+
+    // 2b. Write aligned 32-bit (uint) chunks
+    // We are now at n_mod_64, which is a multiple of 4.
+    uint* M_u = (uint*)ctx->M;
+    int i_u = n_mod_64 / 4;
+    
+    #pragma unroll
+    while(i_u < 14) { // 14 * 4 = 56 bytes
+        M_u[i_u++] = 0;
     }
     
-    for(int i=n_mod_64; i < 56; i++) {
-        ctx->M[i] = 0;
-    }
-    
+    // 3. Write 64-bit length
     ulong n_bits = ctx->N * 8;
     ctx->M[56] = (uchar)(n_bits >> 56);
     ctx->M[57] = (uchar)(n_bits >> 48);
@@ -159,23 +182,26 @@ inline bool sha256_final_and_check(sha256_ctx *ctx, uint difficulty) {
     ctx->M[62] = (uchar)(n_bits >> 8);
     ctx->M[63] = (uchar)(n_bits);
 
+    // 4. Run the final transform
     sha256_transform(ctx);
     
-    // --- OPTIMIZATION: Early Exit & Difficulty Check using clz() ---
+    // 5. OPTIMIZATION: Unrolled Difficulty Check
     uint bits = 0;
-    for (int i = 0; i < 8; i++) {
-        uint h_val = ctx->H[i];
-        uint leading_zeros = clz(h_val); 
-        bits += leading_zeros;
-        if (leading_zeros < 32) {
-            return (bits >= difficulty);
-        }
-        if (bits >= difficulty) return true;
-    }
+    uint h_val, leading_zeros;
+
+    h_val = ctx->H[0]; leading_zeros = clz(h_val); bits += leading_zeros; if (leading_zeros < 32) return (bits >= difficulty); if (bits >= difficulty) return true;
+    h_val = ctx->H[1]; leading_zeros = clz(h_val); bits += leading_zeros; if (leading_zeros < 32) return (bits >= difficulty); if (bits >= difficulty) return true;
+    h_val = ctx->H[2]; leading_zeros = clz(h_val); bits += leading_zeros; if (leading_zeros < 32) return (bits >= difficulty); if (bits >= difficulty) return true;
+    h_val = ctx->H[3]; leading_zeros = clz(h_val); bits += leading_zeros; if (leading_zeros < 32) return (bits >= difficulty); if (bits >= difficulty) return true;
+    h_val = ctx->H[4]; leading_zeros = clz(h_val); bits += leading_zeros; if (leading_zeros < 32) return (bits >= difficulty); if (bits >= difficulty) return true;
+    h_val = ctx->H[5]; leading_zeros = clz(h_val); bits += leading_zeros; if (leading_zeros < 32) return (bits >= difficulty); if (bits >= difficulty) return true;
+    h_val = ctx->H[6]; leading_zeros = clz(h_val); bits += leading_zeros; if (leading_zeros < 32) return (bits >= difficulty); if (bits >= difficulty) return true;
+    h_val = ctx->H[7]; leading_zeros = clz(h_val); bits += leading_zeros;
+    
     return (bits >= difficulty);
 }
 
-// Helper to write the final hash to global memory
+// Helper to write the final hash to global memory (Unchanged)
 inline void write_hash_from_H(__global uchar* hash_out, sha256_ctx *ctx) {
     for(int i = 0; i < 8; i++) {
         hash_out[i*4 + 0] = (uchar)(ctx->H[i] >> 24);
@@ -195,42 +221,19 @@ __kernel void calculate_midstate_kernel(
 ) {
     sha256_ctx ctx;
     sha256_init(&ctx);
-    sha256_update(&ctx, base_line, base_len);
+    // Use the global update function
+    sha256_update_global(&ctx, base_line, base_len);
     *midstate_out = ctx;
-}
-
-
-// --- ADDED: Fast, branchless u64-to-hex converter ---
-inline void ulong_to_hex_fixed16(ulong n, char* out) {
-    const char hex_chars[] = "0123456789abcdef";
-    
-    // Unroll the loop manually for 16 characters (64 bits)
-    out[0]  = hex_chars[(n >> 60) & 0xF];
-    out[1]  = hex_chars[(n >> 56) & 0xF];
-    out[2]  = hex_chars[(n >> 52) & 0xF];
-    out[3]  = hex_chars[(n >> 48) & 0xF];
-    out[4]  = hex_chars[(n >> 44) & 0xF];
-    out[5]  = hex_chars[(n >> 40) & 0xF];
-    out[6]  = hex_chars[(n >> 36) & 0xF];
-    out[7]  = hex_chars[(n >> 32) & 0xF];
-    out[8]  = hex_chars[(n >> 28) & 0xF];
-    out[9]  = hex_chars[(n >> 24) & 0xF];
-    out[10] = hex_chars[(n >> 20) & 0xF];
-    out[11] = hex_chars[(n >> 16) & 0xF];
-    out[12] = hex_chars[(n >> 12) & 0xF];
-    out[13] = hex_chars[(n >> 8)  & 0xF];
-    out[14] = hex_chars[(n >> 4)  & 0xF];
-    out[15] = hex_chars[n & 0xF];
 }
 
 
 /*
  * == KERNEL 2: Find Hash (Run 10M+ times) ==
  *
- * (CORRECTED to use hex-string nonce)
+ * (HEAVILY OPTIMIZED)
  */
 __kernel void find_hash_kernel(
-    __constant const sha256_ctx* midstate, // <-- OPTIMIZATION: Use __constant
+    __constant const sha256_ctx* midstate, // <-- Use __constant
     ulong start_nonce,
     uint difficulty,
     __global uint* result_local_id,
@@ -246,15 +249,32 @@ __kernel void find_hash_kernel(
     // 1. Load the pre-calculated midstate (fast read from constant cache)
     sha256_ctx ctx = *midstate;
 
-    // 2. --- MODIFICATION: Convert u64 nonce to 16-char hex string ---
-    char nonce_hex[16];
-    ulong_to_hex_fixed16(nonce, nonce_hex);
+    // 2. --- OPTIMIZATION: Inlined ulong_to_hex_fixed16 ---
+    uchar nonce_hex[16]; // Use uchar directly
+    const char hex_chars[] = "0123456789abcdef";
     
-    // 3. Update context with the 16-char hex string
-    sha256_update_local(&ctx, (const uchar*)nonce_hex, 16);
+    nonce_hex[0]  = hex_chars[(nonce >> 60) & 0xF];
+    nonce_hex[1]  = hex_chars[(nonce >> 56) & 0xF];
+    nonce_hex[2]  = hex_chars[(nonce >> 52) & 0xF];
+    nonce_hex[3]  = hex_chars[(nonce >> 48) & 0xF];
+    nonce_hex[4]  = hex_chars[(nonce >> 44) & 0xF];
+    nonce_hex[5]  = hex_chars[(nonce >> 40) & 0xF];
+    nonce_hex[6]  = hex_chars[(nonce >> 36) & 0xF];
+    nonce_hex[7]  = hex_chars[(nonce >> 32) & 0xF];
+    nonce_hex[8]  = hex_chars[(nonce >> 28) & 0xF];
+    nonce_hex[9]  = hex_chars[(nonce >> 24) & 0xF];
+    nonce_hex[10] = hex_chars[(nonce >> 20) & 0xF];
+    nonce_hex[11] = hex_chars[(nonce >> 16) & 0xF];
+    nonce_hex[12] = hex_chars[(nonce >> 12) & 0xF];
+    nonce_hex[13] = hex_chars[(nonce >> 8)  & 0xF];
+    nonce_hex[14] = hex_chars[(nonce >> 4)  & 0xF];
+    nonce_hex[15] = hex_chars[nonce & 0xF];
+    
+    // 3. Update context with the 16-char hex string (fast path)
+    sha256_update_local_16_fast(&ctx, (const uchar*)nonce_hex);
 
-    // 4. Finalize hash and check difficulty (now much faster)
-    if (sha256_final_and_check(&ctx, difficulty)) {
+    // 4. Finalize hash and check difficulty (fast path)
+    if (sha256_final_and_check_fast(&ctx, difficulty)) {
         // We found a winner!
         if (atomic_cmpxchg(result_local_id, (uint)(-1), (uint)global_id) == (uint)(-1)) {
             // We were first! Write our hash to the output buffer.
