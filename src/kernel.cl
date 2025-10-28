@@ -290,10 +290,6 @@ __kernel void find_hash_kernel(
     ulong global_id = get_global_id(0);
     ulong nonce = start_nonce + global_id;
 
-    if (*result_local_id != (uint)(-1)) {
-        return;
-    }
-
     // 1. Load the pre-calculated H-state into private registers
     sha256_ctx ctx;
     ctx.H[0] = midstate->H[0];
