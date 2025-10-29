@@ -39,7 +39,7 @@ const OPENCL_KERNEL_SRC: &str = include_str!("kernel.cl");
 // Must be a multiple of 64 or 256 for optimal GPU occupancy.
 const LOCAL_WORK_SIZE: usize = 256;
 // 10.4M is a good starting point. (256 * 40960)
-const GLOBAL_WORK_SIZE: usize = 10_485_760;
+const GLOBAL_WORK_SIZE: usize = 41_943_040; // 10_485_760;
 const NO_RESULT: u32 = u32::MAX;
 
 /// The GpuMiner struct holds the persistent OpenCL objects.

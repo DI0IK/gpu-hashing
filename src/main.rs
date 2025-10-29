@@ -37,9 +37,9 @@ lazy_static::lazy_static! {
 }
 
 const SERVER_URL: &str = "http://hash.h10a.de/?raw";
-const MIN_REQUEST_GAP: Duration = Duration::from_millis(2100);
+const MIN_REQUEST_GAP: Duration = Duration::from_millis(1100);
 // --- ADDED: How often to check for a new parent hash ---
-const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+const CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 // --- MODIFIED: HashClient is now Clone ---
 // We need to clone it for the new checker thread.
