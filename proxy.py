@@ -14,8 +14,8 @@ HEADERS = {'User-Agent': 'Python HashGame Analyzer (Bot)'}
 DATA_DIR = '/data'
 TREE_FILE = os.path.join(DATA_DIR, 'hash_tree.json')
 ACTIVE_HASHES_FILE = os.path.join(DATA_DIR, 'active_hashes.json')
-CHECK_INTERVAL = 5  # Seconds
-WORKER_SLEEP = 5.0   # Seconds to sleep between fetches in the worker
+CHECK_INTERVAL = 1  # Seconds (poll interval)
+WORKER_SLEEP = 1.0   # Seconds to sleep between fetches in the worker
 
 # --- Global Shared State & Lock ---
 shared_tree = {}
@@ -522,8 +522,13 @@ def scraper_loop():
     while True:
         try:
             # 1. Check for new hashes from the main page
+            # Only check the main page when the fetch queue is empty.
+            # This avoids adding more work while existing queued items are being processed.
             print("--- Checking for new active hashes ---")
-            check_for_updates() # This now adds to the queue
+            if fetch_queue.empty():
+                check_for_updates() # This now adds to the queue
+            else:
+                print(f"Skipping check_for_updates() because fetch queue is not empty (size: {fetch_queue.qsize()}).")
             
             # 2. Log best path (still useful to see)
             with data_lock:
