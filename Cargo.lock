@@ -1081,6 +1081,8 @@ dependencies = [
  "rand",
  "rayon",
  "reqwest",
+ "serde",
+ "serde_json",
  "sha2",
  "tui",
 ]

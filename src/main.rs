@@ -1,6 +1,7 @@
 use rand::{thread_rng, Rng};
 // rayon used for thread count; we don't need ParallelIterator here
 use reqwest::blocking::Client;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs;
@@ -80,7 +81,8 @@ struct UIState {
     show_parent_menu: bool,
     parent_menu_index: usize,
     // History of seen parents (server- or user-selected). Shown in popup.
-    parent_history: Vec<String>,
+    // Each entry is (hash, height, user). height may be -1 when unknown.
+    parent_history: Vec<(String, i32, String)>,
     // When true, show a small text input allowing arbitrary parent entry
     show_parent_input: bool,
     parent_input_buffer: String,
@@ -125,7 +127,9 @@ impl UIState {
             device_menu_index: 0,
             show_parent_menu: false,
             parent_menu_index: 0,
-            parent_history: vec![parent],
+            // store tuples of (hash, height, user). Initial entry has unknown
+            // height and user.
+            parent_history: vec![(parent, -1, String::new())],
             show_parent_input: false,
             parent_input_buffer: String::new(),
             available_devices: Vec::new(),
@@ -255,34 +259,93 @@ impl HashClient {
 
     /// Gets the latest parent hash from the default server URL.
     fn get_latest_parent(&self) -> Result<ServerState, String> {
-        self.get_server_state(SERVER_URL)
+        // Use the local hash-tree API to pick the parent (best -B6 path).
+        // We still need a difficulty value (from the mining server), so
+        // fetch difficulty via the original server but ignore its chosen parent
+        // — parents must come from the tree API.
+        let best_parent = self.get_best_b6_parent(None)?;
+        // Get difficulty from mining server (may rate-limit)
+        let server_state = self.get_server_state(SERVER_URL)?;
+        Ok(ServerState {
+            difficulty: server_state.difficulty,
+            parent_hash: best_parent,
+        })
     }
 
-    /// Fetch the full list of parents from the server `/raw` endpoint.
-    /// Returns a Vec of (hash, level) in the order returned by server.
-    fn get_parent_list(&self) -> Result<Vec<(String, i32)>, String> {
-        // Reuse logic similar to get_server_state but return full list
+    /// Query the local hash-tree API to find the best -B6 parent to mine on.
+    /// If `max_diff` is provided it will be passed as `?max_diff=N` to the
+    /// endpoint. The API base URL can be overridden by the `HASH_TREE_API`
+    /// environment variable (defaults to http://localhost:5000).
+    fn get_best_b6_parent(&self, max_diff: Option<usize>) -> Result<String, String> {
+        // Determine base URL
+        let base =
+            std::env::var("HASH_TREE_API").unwrap_or_else(|_| "http://localhost:5000".to_string());
+        let mut url = format!("{}/api/best_b6_path", base.trim_end_matches('/'));
+        // Resolve effective max_diff: prefer explicit argument, then env var,
+        // otherwise default to 10.
+        let effective_max_diff = if let Some(d) = max_diff {
+            d
+        } else {
+            std::env::var("HASH_MAX_DIFF")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(10)
+        };
+        // Always pass max_diff to the API so the server can filter its search.
+        url = format!("{}?max_diff={}", url, effective_max_diff);
+
         let mut res = self
             .http_client
-            .get(SERVER_URL)
-            .timeout(Duration::from_secs(10))
+            .get(&url)
+            .timeout(Duration::from_secs(5))
             .send()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("Failed to contact hash-tree API: {}", e))?;
 
         let mut body = String::new();
         res.read_to_string(&mut body).map_err(|e| e.to_string())?;
 
-        let mut lines = body.lines();
-        // First line is difficulty; ignore it here
-        let _ = lines.next();
+        // Parse JSON and extract `best_node`
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("Invalid JSON from hash-tree API: {}", e))?;
+        if let Some(best) = v.get("best_node").and_then(|b| b.as_str()) {
+            Ok(best.to_string())
+        } else {
+            Err("hash-tree API did not return `best_node`".to_string())
+        }
+    }
 
-        let mut out: Vec<(String, i32)> = Vec::new();
-        for line in lines {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 2 {
-                if let Ok(level) = parts[1].trim().parse::<i32>() {
-                    out.push((parts[0].trim().to_string(), level));
-                }
+    /// Fetch the full list of parents from the server `/raw` endpoint.
+    /// Returns a Vec of (hash, level) in the order returned by server.
+    fn get_parent_list(&self) -> Result<Vec<(String, i32, String)>, String> {
+        // Use the tree API's `/api/tree_data` endpoint to retrieve node list.
+        let base =
+            std::env::var("HASH_TREE_API").unwrap_or_else(|_| "http://localhost:5000".to_string());
+        let url = format!("{}/api/tree_data", base.trim_end_matches('/'));
+
+        let mut res = self
+            .http_client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .map_err(|e| format!("Failed to contact tree API: {}", e))?;
+
+        let mut body = String::new();
+        res.read_to_string(&mut body).map_err(|e| e.to_string())?;
+
+        // Parse JSON array of nodes. Each node has `id` and `height`.
+        let v: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("Invalid JSON from tree API: {}", e))?;
+        let arr = v.as_array().ok_or("tree API did not return an array")?;
+        let mut out: Vec<(String, i32, String)> = Vec::new();
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
+                let height = item.get("height").and_then(|h| h.as_i64()).unwrap_or(-1) as i32;
+                let user = item
+                    .get("user")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                out.push((id.to_string(), height, user));
             }
         }
         Ok(out)
@@ -413,6 +476,7 @@ fn format_hash_rate(rate: f64) -> String {
 fn spawn_checker_thread(
     client: HashClient,
     current_parent: String,
+    current_difficulty: usize,
     stop_signal: Arc<AtomicBool>,
     ui_state: Arc<Mutex<UIState>>,
 ) -> thread::JoinHandle<()> {
@@ -436,7 +500,26 @@ fn spawn_checker_thread(
             // 3. Check the server
             match client.get_latest_parent() {
                 Ok(state) => {
-                    // 4. Compare parent hash
+                    // 4a. Compare difficulty and restart miner on any change
+                    if state.difficulty != current_difficulty {
+                        if let Ok(mut ui) = ui_state.lock() {
+                            ui.push_event(format!(
+                                "Server difficulty changed: {} -> {}",
+                                current_difficulty, state.difficulty
+                            ));
+                        }
+
+                        // Signal the miner to stop so main restarts with new difficulty
+                        if stop_signal
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            // nothing else here; main will pick up new difficulty
+                        }
+                        break; // Stop this checker thread
+                    }
+
+                    // 4b. Compare parent hash
                     if state.parent_hash != current_parent {
                         // If the UI has locked the parent, do not change it.
                         if let Ok(mut ui) = ui_state.lock() {
@@ -446,8 +529,9 @@ fn spawn_checker_thread(
                             ));
 
                             // Add server parent to history for user's reference
-                            if !ui.parent_history.iter().any(|p| p == &state.parent_hash) {
-                                ui.parent_history.insert(0, state.parent_hash.clone());
+                            if !ui.parent_history.iter().any(|p| p.0 == state.parent_hash) {
+                                ui.parent_history
+                                    .insert(0, (state.parent_hash.clone(), -1, String::new()));
                                 if ui.parent_history.len() > 64 {
                                     ui.parent_history.pop();
                                 }
@@ -635,11 +719,27 @@ fn spawn_tui(
                         let popup_y = (size.height.saturating_sub(popup_height)) / 2;
 
                         let mut lines: Vec<Spans> = Vec::new();
-                        for (i, p) in ui.parent_history.iter().enumerate().take(10) {
-                            if i == ui.parent_menu_index {
-                                lines.push(Spans::from(vec![Span::raw(format!("> {}", p))]));
-                            } else {
-                                lines.push(Spans::from(vec![Span::raw(format!("  {}", p))]));
+                        let total = ui.parent_history.len();
+                        let show_count = total.min(10);
+                        // Ensure the selected index is visible: compute window start
+                        let start = if ui.parent_menu_index + 1 > show_count {
+                            ui.parent_menu_index + 1 - show_count
+                        } else {
+                            0
+                        };
+                        for idx in start..(start + show_count) {
+                            if let Some((hash, height, user)) = ui.parent_history.get(idx) {
+                                let short = if hash.len() > 12 {
+                                    format!("{}...", &hash[..12])
+                                } else {
+                                    hash.clone()
+                                };
+                                let text = if idx == ui.parent_menu_index {
+                                    format!("> {} {} h={}", short, user, height)
+                                } else {
+                                    format!("  {} {} h={}", short, user, height)
+                                };
+                                lines.push(Spans::from(vec![Span::raw(text)]));
                             }
                         }
 
@@ -815,12 +915,13 @@ fn spawn_tui(
                                             if !ui.parent_history.is_empty() {
                                                 let choice =
                                                     ui.parent_history[ui.parent_menu_index].clone();
-                                                ui.selected_parent = Some(choice.clone());
-                                                ui.parent = choice.clone();
+                                                let hash = choice.0.clone();
+                                                ui.selected_parent = Some(hash.clone());
+                                                ui.parent = hash.clone();
                                                 ui.show_parent_menu = false;
                                                 events::publish_event(&format!(
                                                     "Parent selected by user: {}",
-                                                    choice
+                                                    hash
                                                 ));
                                                 // Signal miner to stop so main can restart with new parent
                                                 if let Ok(shared) = shared_stop_signal.lock() {
@@ -872,18 +973,16 @@ fn spawn_tui(
                                     // Fetch in this thread (blocking) then populate UI
                                     match client.get_parent_list() {
                                         Ok(mut list) => {
-                                            // sort by level desc (newest/highest first)
+                                            // sort by height desc (newest/highest first)
                                             list.sort_by(|a, b| b.1.cmp(&a.1));
-                                            let hashes: Vec<String> =
-                                                list.into_iter().map(|(h, _)| h).collect();
                                             if let Ok(mut ui) = ui_clone.lock() {
-                                                if !hashes.is_empty() {
-                                                    ui.parent_history = hashes;
+                                                if !list.is_empty() {
+                                                    ui.parent_history = list;
                                                 }
                                                 ui.parent_menu_index = ui
                                                     .parent_history
                                                     .iter()
-                                                    .position(|p| *p == ui.parent)
+                                                    .position(|p| p.0 == ui.parent)
                                                     .unwrap_or(0);
                                                 ui.show_parent_menu = true;
                                             }
@@ -898,7 +997,7 @@ fn spawn_tui(
                                                 ui.parent_menu_index = ui
                                                     .parent_history
                                                     .iter()
-                                                    .position(|p| *p == ui.parent)
+                                                    .position(|p| p.0 == ui.parent)
                                                     .unwrap_or(0);
                                                 ui.show_parent_menu = true;
                                             }
@@ -979,6 +1078,12 @@ fn main() {
     }
 
     let client = HashClient::new(name);
+    // SILENT_PRECOMPUTE mode: if set to an integer difficulty, silently
+    // precompute chains and append resulting parent hashes to a file.
+    let silent_precompute_env = std::env::var("SILENT_PRECOMPUTE").ok();
+    let silent_precompute = silent_precompute_env.is_some();
+    let silent_precompute_difficulty: Option<usize> =
+        silent_precompute_env.and_then(|s| s.parse::<usize>().ok());
     // --- ADDED: Debug mode from environment ---
     // If DEBUG_MODE is set to "1" (or any non-empty value), we enable debug.
     // If DEBUG_DIFFICULTY is set, use it as a fixed difficulty for mining.
@@ -1026,18 +1131,52 @@ fn main() {
     };
     // ------------------------------------------------
 
-    // Get initial parent
-    match client.get_latest_parent() {
-        Ok(state) => {
-            events::publish_event(&format!("[Net] Difficulty: {}", state.difficulty));
-            events::publish_event(&format!("[Net] New parent hash: {}", state.parent_hash));
-            current_parent = state.parent_hash;
-            current_difficulty = state.difficulty;
-        }
-        Err(e) => {
-            events::publish_event(&format!("Fatal Error: Could not get initial parent: {}", e));
+    // Get initial parent. In silent_precompute mode prefer the tree API and
+    // use the precompute difficulty (do not contact the mining server for difficulty).
+    if silent_precompute {
+        if let Some(d) = silent_precompute_difficulty {
+            match client.get_best_b6_parent(None) {
+                Ok(best) => {
+                    events::publish_event(&format!("[Precompute] Starting with parent: {}", best));
+                    current_parent = best;
+                    current_difficulty = d;
+                }
+                Err(e) => {
+                    events::publish_event(&format!(
+                        "Fatal Error: Could not get initial parent from tree API: {}",
+                        e
+                    ));
+                    return;
+                }
+            }
+        } else {
+            events::publish_event("Fatal Error: SILENT_PRECOMPUTE set but not a valid integer");
             return;
         }
+    } else {
+        match client.get_latest_parent() {
+            Ok(state) => {
+                events::publish_event(&format!("[Net] Difficulty: {}", state.difficulty));
+                events::publish_event(&format!("[Net] New parent hash: {}", state.parent_hash));
+                current_parent = state.parent_hash;
+                current_difficulty = state.difficulty;
+            }
+            Err(e) => {
+                events::publish_event(&format!("Fatal Error: Could not get initial parent: {}", e));
+                return;
+            }
+        }
+    }
+
+    // Query local hash-tree API for the best -B6 parent (optional)
+    if let Ok(best) = client.get_best_b6_parent(None) {
+        // Only adopt the best parent if it's non-empty and different
+        if !best.is_empty() && best != current_parent {
+            events::publish_event(&format!("[Tree API] Best -B6 parent: {} (adopting)", best));
+            current_parent = best.clone();
+        }
+    } else {
+        events::publish_event("[Tree API] No best -B6 parent available or API unreachable");
     }
 
     // Create UI state and spawn the TUI and stats threads
@@ -1065,6 +1204,12 @@ fn main() {
         // Make sure current device is one of the available ones
         if !ui.available_devices.iter().any(|d| d == &ui.device) {
             ui.device = ui.available_devices[0].clone();
+        }
+        // If running in silent precompute mode, auto-lock the parent so
+        // the UI won't overwrite the current parent from server updates.
+        if silent_precompute {
+            ui.lock_parent = true;
+            ui.push_event("Silent precompute: parent locked".to_string());
         }
     }
 
@@ -1135,13 +1280,41 @@ fn main() {
             }
         }
 
-        // 2. Spawn the checker thread
-        let checker_handle = spawn_checker_thread(
-            client.clone(),
-            current_parent.clone(),
-            stop_signal.clone(),
-            ui_state.clone(),
-        );
+        // If the UI isn't locking the parent, consult the local hash-tree API
+        // to see if there's a better -B6 parent to mine on for this round.
+        if let Ok(mut ui) = ui_state.lock() {
+            if !ui.lock_parent {
+                // get_best_b6_parent will use BEST_B6_MAX_DIFF env or default=10
+                match client.get_best_b6_parent(None) {
+                    Ok(best) => {
+                        if !best.is_empty() && best != current_parent {
+                            events::publish_event(&format!(
+                                "[Tree API] Found better -B6 parent: {} (adopting)",
+                                best
+                            ));
+                            current_parent = best.clone();
+                            ui.parent = best;
+                        }
+                    }
+                    Err(_) => {
+                        // Ignore API failures for this round; continue with current_parent
+                    }
+                }
+            }
+        }
+
+        // 2. Spawn the checker thread (skip in silent precompute mode)
+        let checker_handle = if silent_precompute {
+            None
+        } else {
+            Some(spawn_checker_thread(
+                client.clone(),
+                current_parent.clone(),
+                current_difficulty,
+                stop_signal.clone(),
+                ui_state.clone(),
+            ))
+        };
 
         // Honor device selection from the UI: switch GPU on/off as requested
         let ui_device_choice = if let Ok(ui) = ui_state.lock() {
@@ -1236,15 +1409,47 @@ fn main() {
             client.find_seed_cpu(&current_parent, effective_difficulty, stop_signal.clone())
         };
 
-        // 4. Stop the checker thread
-        // (It may have already stopped, this is safe)
+        // 4. Stop the checker thread (if we spawned one)
         stop_signal.store(true, Ordering::SeqCst);
-        checker_handle.join().unwrap(); // Wait for it to exit
+        if let Some(h) = checker_handle {
+            let _ = h.join();
+        }
 
         // 5. Process the result
         if let Some((seed, our_hash_hex)) = mining_result {
             // --- We found a hash! ---
-            if debug_enabled {
+            if silent_precompute {
+                // In silent precompute mode: append the found hash (the next parent)
+                // to a file and continue using it as the next parent.
+                let path = std::path::Path::new("precompute_chain.txt");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    use std::io::Write;
+                    // Save timestamp, full input line, and full hash hex.
+                    let line = client.get_line(&current_parent, &seed);
+                    let ts =
+                        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                            Ok(d) => format!("{}", d.as_millis()),
+                            Err(_) => "0".to_string(),
+                        };
+                    let _ = writeln!(f, "{} | {} | {}", ts, line, our_hash_hex);
+                }
+                events::publish_event(&format!(
+                    "[Precompute] Found and saved full hashed line to precompute_chain.txt: {}",
+                    our_hash_hex
+                ));
+                // Adopt the found hash as the next parent and continue
+                current_parent = our_hash_hex.clone();
+                if let Ok(mut ui) = ui_state.lock() {
+                    ui.parent = current_parent.clone();
+                    ui.increment_blocks();
+                }
+                // continue to next round without submitting
+                continue;
+            } else if debug_enabled {
                 // In debug mode we don't submit to server.
                 events::publish_event("[Debug] Found seed (not submitting):");
                 events::publish_event(&format!("    Parent: {}", current_parent));

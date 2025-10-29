@@ -1,2 +1,4 @@
 /target
 blocks_mined.txt
+venv
+*.json
