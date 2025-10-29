@@ -164,13 +164,23 @@ def process_single_hash(hash_to_fetch):
         return
 
     # --- This is the core scrape ---
-    parent_hash, user, children_list, height = scrape_node_data(hash_to_fetch)
-    
-    if user == "Unknown" and parent_hash is None and not children_list and height == 0:
-        # Requeue the hash for a retry later
-        print(f"Failed to scrape node {hash_to_fetch}. Requeuing for retry.")
-        add_to_fetch_queue(hash_to_fetch)
-        return
+    retry_limit = 3  # Maximum number of retries for a single hash
+    retry_count = 0
+
+    while retry_count < retry_limit:
+      parent_hash, user, children_list, height = scrape_node_data(hash_to_fetch)
+      
+      if user != "Unknown" or parent_hash or children_list or height > 0:
+        # Successfully scraped the node
+        break
+      
+      retry_count += 1
+      print(f"Failed to scrape node {hash_to_fetch}. Retry {retry_count}/{retry_limit}.")
+      time.sleep(2)  # Small delay before retrying
+
+    if retry_count == retry_limit:
+      print(f"Failed to scrape node {hash_to_fetch} after {retry_limit} retries. Skipping.")
+      return
         
     # --- Queue parent and children ---
     add_to_fetch_queue(parent_hash)
