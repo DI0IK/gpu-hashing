@@ -167,10 +167,9 @@ def process_single_hash(hash_to_fetch):
     parent_hash, user, children_list, height = scrape_node_data(hash_to_fetch)
     
     if user == "Unknown" and parent_hash is None and not children_list and height == 0:
-        print(f"Failed to scrape {hash_to_fetch}. Will not be retried unless re-queued.")
-        with data_lock:
-            if hash_to_fetch in in_queue_set:
-                in_queue_set.remove(hash_to_fetch)
+        # Requeue the hash for a retry later
+        print(f"Failed to scrape node {hash_to_fetch}. Requeuing for retry.")
+        add_to_fetch_queue(hash_to_fetch)
         return
         
     # --- Queue parent and children ---
