@@ -264,35 +264,37 @@ def populate_queue_from_stubs():
     """
     global shared_tree
     
+    # Take a snapshot once (no lock held while we iterate and call add_to_fetch_queue).
     with data_lock:
         tree_snapshot = shared_tree.copy()
-        
+
     print(f"Scanning {len(tree_snapshot)} loaded nodes for missing stubs...")
-    
+
     stubs_found = 0
+
+    # We use the local tree_snapshot for lookups so we don't need to acquire
+    # data_lock while calling add_to_fetch_queue (which itself acquires the lock).
     for node_hash, node_data in tree_snapshot.items():
         # 1. Check self (if this node is just a stub)
         if not node_data.get('scraped', False):
-             add_to_fetch_queue(node_hash)
-             stubs_found += 1
-             continue # No need to check its children if it's not scraped
-             
-        # 2. Check parent
+            add_to_fetch_queue(node_hash)
+            stubs_found += 1
+            continue  # No need to check its children if it's not scraped
+
+        # 2. Check parent using the snapshot
         parent_hash = node_data.get('parent')
         if parent_hash:
-            with data_lock:
-                parent_node = shared_tree.get(parent_hash)
-                if not parent_node or not parent_node.get('scraped', False):
-                    add_to_fetch_queue(parent_hash)
-                    stubs_found += 1
-                    
-        # 3. Check children
+            parent_node = tree_snapshot.get(parent_hash)
+            if not parent_node or not parent_node.get('scraped', False):
+                add_to_fetch_queue(parent_hash)
+                stubs_found += 1
+
+        # 3. Check children using the snapshot
         for child_hash in node_data.get('children', []):
-            with data_lock:
-                child_node = shared_tree.get(child_hash)
-                if not child_node or not child_node.get('scraped', False):
-                    add_to_fetch_queue(child_hash)
-                    stubs_found += 1
+            child_node = tree_snapshot.get(child_hash)
+            if not child_node or not child_node.get('scraped', False):
+                add_to_fetch_queue(child_hash)
+                stubs_found += 1
 
     print(f"Found and queued {stubs_found} stubs from loaded data. (Actual queue size: {fetch_queue.qsize()})")
 
