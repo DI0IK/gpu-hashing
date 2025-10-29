@@ -14,8 +14,8 @@ HEADERS = {'User-Agent': 'Python HashGame Analyzer (Bot)'}
 DATA_DIR = '/data'
 TREE_FILE = os.path.join(DATA_DIR, 'hash_tree.json')
 ACTIVE_HASHES_FILE = os.path.join(DATA_DIR, 'active_hashes.json')
-CHECK_INTERVAL = 2  # Seconds
-WORKER_SLEEP = 2.0   # Seconds to sleep between fetches in the worker
+CHECK_INTERVAL = 5  # Seconds
+WORKER_SLEEP = 5.0   # Seconds to sleep between fetches in the worker
 
 # --- Global Shared State & Lock ---
 shared_tree = {}
