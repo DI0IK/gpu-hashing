@@ -16,6 +16,10 @@ pub fn publish_event(msg: &str) {
     if let Ok(g) = EVENT_SENDER.lock() {
         if let Some(tx) = &*g {
             let _ = tx.send(msg.to_string());
+        } else {
+            println!("No receiver available to send the event: {}", msg);
         }
+    } else {
+        println!("Failed to acquire lock on EVENT_SENDER");
     }
 }

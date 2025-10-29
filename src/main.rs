@@ -279,7 +279,7 @@ impl HashClient {
     fn get_best_b6_parent(&self, max_diff: Option<usize>) -> Result<String, String> {
         // Determine base URL
         let base = std::env::var("HASH_TREE_API")
-            .unwrap_or_else(|_| "https://hash_proxy.dominikstahl.dev".to_string());
+            .unwrap_or_else(|_| "https://hashproxy.dominikstahl.dev".to_string());
         let mut url = format!("{}/api/best_b6_path", base.trim_end_matches('/'));
         // Resolve effective max_diff: prefer explicit argument, then env var,
         // otherwise default to 10.
@@ -318,8 +318,8 @@ impl HashClient {
     /// Returns a Vec of (hash, level) in the order returned by server.
     fn get_parent_list(&self) -> Result<Vec<(String, i32, String)>, String> {
         // Use the tree API's `/api/tree_data` endpoint to retrieve node list.
-        let base =
-            std::env::var("HASH_TREE_API").unwrap_or_else(|_| "http://localhost:5000".to_string());
+        let base = std::env::var("HASH_TREE_API")
+            .unwrap_or_else(|_| "https://hashproxy.dominikstahl.dev".to_string());
         let url = format!("{}/api/tree_data", base.trim_end_matches('/'));
 
         let mut res = self
@@ -1162,8 +1162,32 @@ fn main() {
                 current_difficulty = state.difficulty;
             }
             Err(e) => {
-                events::publish_event(&format!("Fatal Error: Could not get initial parent: {}", e));
-                return;
+                // Don't exit immediately if the tree API failed; try to fall back
+                // to the original mining server for a parent/difficulty so the
+                // client can still start in environments with TLS/name issues.
+                events::publish_event(&format!(
+                    "Warning: could not get latest parent from tree API: {}. Falling back to mining server...",
+                    e
+                ));
+
+                match client.get_server_state(SERVER_URL) {
+                    Ok(srv) => {
+                        events::publish_event(&format!("[Net] Difficulty: {}", srv.difficulty));
+                        events::publish_event(&format!(
+                            "[Net] New parent hash: {}",
+                            srv.parent_hash
+                        ));
+                        current_parent = srv.parent_hash;
+                        current_difficulty = srv.difficulty;
+                    }
+                    Err(e2) => {
+                        events::publish_event(&format!(
+                            "Fatal Error: Could not get initial parent from mining server either: {}",
+                            e2
+                        ));
+                        return;
+                    }
+                }
             }
         }
     }
