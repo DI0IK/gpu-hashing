@@ -116,7 +116,7 @@ impl UIState {
     fn new(username: String, parent: String, device: String) -> Self {
         let total_blocks_mined = load_blocks_mined_from_disk();
         UIState {
-            recent_events: VecDeque::with_capacity(32),
+            recent_events: VecDeque::with_capacity(1000),
             hash_rate: 0.0,
             username,
             parent: parent.clone(),
@@ -139,7 +139,7 @@ impl UIState {
     }
 
     fn push_event(&mut self, e: String) {
-        const MAX_EVENTS: usize = 16;
+        const MAX_EVENTS: usize = 1000;
         self.recent_events.push_front(e);
         while self.recent_events.len() > MAX_EVENTS {
             self.recent_events.pop_back();
