@@ -275,11 +275,11 @@ impl HashClient {
     /// Query the local hash-tree API to find the best -B6 parent to mine on.
     /// If `max_diff` is provided it will be passed as `?max_diff=N` to the
     /// endpoint. The API base URL can be overridden by the `HASH_TREE_API`
-    /// environment variable (defaults to http://localhost:5000).
+    /// environment variable (defaults to https://hash_proxy.dominikstahl.dev).
     fn get_best_b6_parent(&self, max_diff: Option<usize>) -> Result<String, String> {
         // Determine base URL
-        let base =
-            std::env::var("HASH_TREE_API").unwrap_or_else(|_| "http://localhost:5000".to_string());
+        let base = std::env::var("HASH_TREE_API")
+            .unwrap_or_else(|_| "https://hash_proxy.dominikstahl.dev".to_string());
         let mut url = format!("{}/api/best_b6_path", base.trim_end_matches('/'));
         // Resolve effective max_diff: prefer explicit argument, then env var,
         // otherwise default to 10.
