@@ -2,18 +2,19 @@ import requests
 import time
 import json
 from bs4 import BeautifulSoup
-import re
 import threading
-import queue  # <-- Added import
-from flask import Flask, jsonify, request, send_from_directory, render_template
+import queue
+from flask import Flask, jsonify, request
 import os
 
 # --- Configuration ---
 BASE_URL = "http://hash.h10a.de/"
 HEADERS = {'User-Agent': 'Python HashGame Analyzer (Bot)'}
-TREE_FILE = 'hash_tree.json'
-ACTIVE_HASHES_FILE = 'active_hashes.json'
-CHECK_INTERVAL = 2  # Seconds
+# Store JSON data under a single data directory (can be mounted into the container)
+DATA_DIR = '/data'
+TREE_FILE = os.path.join(DATA_DIR, 'hash_tree.json')
+ACTIVE_HASHES_FILE = os.path.join(DATA_DIR, 'active_hashes.json')
+CHECK_INTERVAL = 10  # Seconds
 WORKER_SLEEP = 1.0   # Seconds to sleep between fetches in the worker
 
 # --- Global Shared State & Lock ---
