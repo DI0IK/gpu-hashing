@@ -501,7 +501,7 @@ def find_best_b6_node(max_diff=None):
                 parent_score = total_score
                 
                 # Check if this node is the new best
-                current_height = node_data['height'] if node_data else 0
+                current_height = node_data['height'] if node_data and node_data['height'] else 0
                 if total_score > max_b6_count and current_height >= min_height_filter:
                     max_b6_count = total_score
                     best_node = node_to_calc_hash
