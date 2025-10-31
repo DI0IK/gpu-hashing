@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
-COPY hash_scraper_refactored.py .
+COPY proxy.py .
 
 # Create the /data directory and set permissions
 # This ensures the app user can write to the volume
@@ -34,4 +34,4 @@ VOLUME /data
 
 # The command to run the application
 # We run the script directly, as it manages its own threads and Flask server
-CMD ["python", "hash_scraper_refactored.py"]
+CMD ["python", "proxy.py"]
