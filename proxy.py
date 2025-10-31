@@ -9,6 +9,7 @@ import logging
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request
 from concurrent.futures import ThreadPoolExecutor
+from waitress import serve
 
 # --- Configuration ---
 # Use environment variables for flexibility, with sensible defaults
@@ -651,9 +652,6 @@ def poller_thread():
                 check_for_updates()
             else:
                 logging.info(f"Skipping poll. FetchQueue: {fetch_queue.qsize()}, WriteQueue: {db_write_queue.qsize()}")
-
-            # Log best path periodically
-            find_best_b6_node(max_diff=None)
             
             logging.info(f"Poller waiting {POLL_INTERVAL_SEC}s. FetchQueue: {fetch_queue.qsize()}, WriteQueue: {db_write_queue.qsize()}")
             time.sleep(POLL_INTERVAL_SEC)
@@ -687,13 +685,18 @@ def main():
     threading.Thread(target=poller_thread, daemon=True, name="Poller").start()
     
     logging.info("\n========================================================")
-    logging.info("Starting Flask API server on http://0.0.0.0:5000/")
+    logging.info("Starting production WSGI server on http://0.0.0.0:5000/")
     logging.info("View the visualization at: http://127.0.0.1:5000/")
     logging.info("========================================================\n")
     
     # Run the Flask app in the main thread
     # Turn off reloader to prevent threads from being started twice
-    app.run(host='0.0.0.0', port=5000, use_reloader=False, threaded=True)
+    # OLD: app.run(host='0.0.0.0', port=5000, use_reloader=False, threaded=True)
+    
+    # NEW: Use the production-ready waitress server.
+    # It will serve the 'app' object, and the background threads
+    # will continue running as they are in daemon mode.
+    serve(app, host='0.0.0.0', port=5000, threads=16)
 
 if __name__ == "__main__":
     main()
